@@ -49,7 +49,7 @@ prosodic-accommodation/
 To run the full analysis, use:
 
    ```commandline
-   python prosodic_accomodation_pipeline.py --audio_dir path/to/audio --transcripts path/to/transcripts --output results.csv
+   python prosodic_accomodation_pipeline.py prosodic_accomodation_pipeline --audio_path data/audio/audio-2.wav --diarization_path          data/combine_speech_turns_df.csv --results_path "results.csv" --accomodation_type turn_level --language_code fr
    ```
 You can also explore other scripts for more specific analyses:
 
