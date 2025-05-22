@@ -1,4 +1,4 @@
-# VibeCheck
+# VibeChecker
 
 This Python package calculates prosodic accommodation between two speakers in a conversation. It extracts and compares speech features turn-by-turn or via summary measures.
 
