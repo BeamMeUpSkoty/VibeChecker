@@ -2,18 +2,22 @@ import parselmouth
 import librosa
 import numpy as np
 from collections import ChainMap
+from typing import Dict
 
 class AudioFeatures(object):
+	""" Extract acoustic features from an audio file
+
+	Praat Manual: https://www.fon.hum.uva.nl/praat/manual/Query_submenu.html
 	"""
-	"""
-	def __init__(self, path, languageCode):
-		self.path = path
-		self.languageCode = languageCode
-		self.source_type = 'audio'
-		self.sound = sound = parselmouth.Sound(self.path)
+	def __init__(self, path: str, languageCode: str):
+		self.path: str = path
+		print(self.path)
+		self.languageCode: str = languageCode
+		self.source_type: str = 'audio'
+		self.sound: parselmouth.Sound = parselmouth.Sound(self.path)
 
 
-	def get_average_pitch(self, verbose=False):
+	def get_average_pitch(self, verbose: bool = False) -> Dict[str, float]:
 		"""assumes that the WAV file is located in the same directory as the script and is named example.wav. 
 		You may need to modify the script to match the location and name of your own WAV file. 
 		Additionally, you will need to install Praat and the Parselmouth library to run this script.
@@ -24,63 +28,60 @@ class AudioFeatures(object):
 
 		# Extract average pitch
 		pitch_values = pitch.selected_array['frequency']
-		average_pitch = sum(pitch_values) / len(pitch_values)
+		# remove unvoiced frames
+		pitch_values = pitch_values[pitch_values > 0]
 
-		# Print the average pitch
+		average_pitch = float(np.mean(pitch_values)) if len(pitch_values) else 0.0
+
 		if verbose:
 			print(f"The average pitch is {average_pitch:.2f} Hz.")
-
 		return {'average_pitch': average_pitch}
 
 
-	def get_f0_statistics(self, verbose=False):
+	def get_f0_statistics(self, verbose: bool =False):
 		"""
 		"""
-		print('=== HERE ===')
 		# Load the audio file
 		y, sr = librosa.load(self.path)
 
 		# Extract the F0 contour using the Yin algorithm
 		f0, voiced_flag, _ = librosa.pyin(y, fmin=50, fmax=400, sr=sr)
 
+		if f0 is None or not voiced_flag.any():
+			return {}
+
 		# Filter out unvoiced frames
 		f0 = f0[voiced_flag]
 
-		# Extract the minimum F0
-		min_f0 = f0.min()
-		max_f0 = f0.max()
-		mean_f0 = f0.mean()
-		median_f0 = np.median(f0)
-		sd_f0 = np.std(f0)
-		range_f0 = max_f0 - min_f0
-
+		stats = {
+			'min_f0': float(np.min(f0)),
+			'max_f0': float(np.max(f0)),
+			'mean_f0': float(np.mean(f0)),
+			'median_f0': float(np.median(f0)),
+			'sd_f0': float(np.std(f0)),
+			'f0_range': float(np.max(f0) - np.min(f0)),
+		}
 		# Calculate the 80th percentile of F0
-		percentile_80_f0 = np.percentile(f0, 80)
+		percentile_80 = np.percentile(f0, 80)
 		# Filter F0 values above the 80th percentile
-		f0_above_percentile = f0[f0 > percentile_80_f0]
+		high_f0 = f0[f0 > percentile_80]
 		# Calculate the range of F0 values above the 80th percentile
-		range_80th_percentile_f0 = np.max(f0_above_percentile) - np.min(f0_above_percentile)
+		stats['80_percentile_range'] = float(np.max(high_f0) - np.min(high_f0)) if len(high_f0) > 0 else 0.0
 
-		# Print the F0 statistics
 		if verbose:
-			print(f"Minimum F0: {min_f0:.2f} Hz")
-			print(f"Maximum F0: {max_f0:.2f} Hz")
-			print(f"Mean F0: {mean_f0:.2f} Hz")
-			print(f"Median F0: {median_f0:.2f} Hz")
-			print(f"Standard deviation of F0: {sd_f0:.2f} Hz")
-			print(f"80th percentile F0 range: {range_80th_percentile_f0:.2f} Hz")
+			for k, v in stats.items():
+				print(f"{k}: {v:.2f} Hz")
 
-		return {'min_f0':min_f0, 'max_f0':max_f0, 'mean_f0':mean_f0, 'median_f0':median_f0, 'sd_f0':sd_f0, 'f0_range':range_f0, '80_percentile_range':range_80th_percentile_f0}
+		return stats
 
-
-	def get_articulation_rate(self, verbose=False):
+	def get_articulation_rate(self, verbose: bool = False) -> Dict[str, float]:
 		"""
 		"""
 		# Extract textgrid object using Praat's default settings
 		tg = self.sound.to_textgrid()
 
 		# Extract the total duration of the sound file
-		total_duration = sound.get_total_duration()
+		total_duration = self.sound.get_total_duration()
 
 		# Initialize variables for syllable count and pause duration
 		syllable_count = 0
@@ -131,75 +132,84 @@ class AudioFeatures(object):
 
 		return {'syllables_per_second':syllables_per_second}
 
+	def get_cumulative_speech_index(self, verbose: bool = False) -> Dict[str, float]:
+		"""
+        Computes the cumulative speech index (CSI) from the pitch contour.
 
-	def get_cumulative_speech_index(self, verbose=False):
-		"""
-		"""
-		# Extract pitch object using Praat's default settings
+        Returns
+        -------
+        Dict[str, float]
+            Dictionary with key 'csi'.
+        """
 		pitch = self.sound.to_pitch()
+		pitch_values = pitch.selected_array['frequency']
+		pitch_values = pitch_values[pitch_values > 0]  # voiced frames only
 
-		# Initialize variables for the cumulative slope index
-		csi = 0
-		previous_pitch = None
+		time_step = pitch.get_time_step()
+		csi = 0.0
 
-		# Loop through frames in the pitch object
-		for frame in pitch:
-			# Skip frames where the pitch is undefined
-			if frame.x == 0 or frame.xmax == 0:
-				continue
-			
-			# If this is not the first frame, calculate the slope and add it to the CSI
-			if previous_pitch is not None:
-				slope = (frame.frequency - previous_pitch.frequency) / (frame.xmax - previous_pitch.xmax)
-				csi += abs(slope)
-			
-			# Save the current frame as the previous frame for the next iteration
-			previous_pitch = frame
+		for i in range(1, len(pitch_values)):
+			slope = (pitch_values[i] - pitch_values[i - 1]) / time_step
+			csi += abs(slope)
 
 		if verbose:
-			# Print the cumulative slope index
-			print(f"Cumulative slope index: {csi:.2f}")
+			print(f"Cumulative Speech Index (CSI): {csi:.2f}")
 
-		return {'csi':csi}
+		return {'csi': csi}
 
-
-	def get_vocal_intensity_statistics(self, verbose=False):
+	def get_vocal_intensity_statistics(self, verbose: bool = False) -> Dict[str, float]:
 		"""
-		"""
+        Extracts basic intensity statistics from the entire file using Praat’s Intensity object.
+        """
 
-		# Extract intensity object using Praat's default settings
-		intensity = self.sound.to_intensity()
+		# 1. Turn the Sound into an Intensity object (default window & time step)
+		intensity: parselmouth.Intensity = self.sound.to_intensity()
 
-		# Calculate various statistics of intensity
-		intensity_min = parselmouth.praat.call(intensity, "Get minimum", 0, 0, "Hertz")
-		intensity_max = parselmouth.praat.call(intensity, "Get maximum", 0, 0, "Hertz")
-		intensity_mean = parselmouth.praat.call(intensity, "Get mean", 0, 0, "Hertz")
-		intensity_stddev = parselmouth.praat.call(intensity, "Get standard deviation", 0, 0, "Hertz")
-		intensity_quartiles = parselmouth.praat.call(intensity, "Get quantiles", 0, 0, "Hertz", 4)
+		# 2. “Get minimum” / “Get maximum” require an interpolation method, not “dB”.
+		#    Here we use “Parabolic” (you can also choose “Cubic” or “None”).
+		min_intensity = parselmouth.praat.call(
+			intensity, "Get minimum", 0.0, 0.0, "Parabolic"
+		)
+		max_intensity = parselmouth.praat.call(
+			intensity, "Get maximum", 0.0, 0.0, "Parabolic"
+		)
+
+		# 3. “Get mean” takes an averaging method; passing “dB” returns the mean in dB.
+		mean_intensity = parselmouth.praat.call(
+			intensity, "Get mean", 0.0, 0.0, "dB"
+		)
+
+		# 4. “Get standard deviation” only takes the time‐range (two floats).
+		#    It always returns dB‐based standard deviation.
+		sd_intensity = parselmouth.praat.call(
+			intensity, "Get standard deviation", 0.0, 0.0
+		)
+
+		# 6. Cast each to float and build the stats dict
+		stats = {
+			"min_intensity": float(min_intensity),
+			"max_intensity": float(max_intensity),
+			"mean_intensity": float(mean_intensity),
+			"sd_intensity": float(sd_intensity),
+		}
 
 		if verbose:
-			# Print the statistics of intensity
-			print(f"Minimum intensity: {intensity_min:.2f} dB")
-			print(f"Maximum intensity: {intensity_max:.2f} dB")
-			print(f"Mean intensity: {intensity_mean:.2f} dB")
-			print(f"Standard deviation of intensity: {intensity_stddev:.2f} dB")
-			print(f"25th percentile intensity: {intensity_quartiles[0]:.2f} dB")
-			print(f"50th percentile intensity: {intensity_quartiles[1]:.2f} dB")
-			print(f"75th percentile intensity: {intensity_quartiles[2]:.2f} dB")
-			print(f"100th percentile intensity: {intensity_quartiles[3]:.2f} dB")
+			for name, value in stats.items():
+				print(f"{name}: {value:.2f} dB")
 
-		return {'min_intensity':intensity_min, 'max_intensity':intensity_max, 'mean intensity':intensity_mean, 'sd_intensity':intensity_stddev, '25_intensity':intensity_quartiles[0], '50_intensity':intensity_quartiles[1], '75_intensity':intensity_quartiles[2], '100_intensity':intensity_quartiles[3]}
+		return stats
 
-
-	def get_all_features(self, verbose=True):
+	def get_all_features(self, verbose: bool = True) -> Dict[str, float]:
 		"""
+		Combines all extracted features into a single dictionary.
 		"""
-		average_pitch = self.get_average_pitch(verbose=verbose)
-		#f0_statistics = self.get_f0_statistics(verbose=verbose)
-		#articulation_rate = self.get_articulation_rate(verbose=verbose)
-		#csi = self.get_cumulative_speech_index(verbose=verbose)
-		#vocal_intensity = self.get_vocal_intensity_statistics(verbose=verbose)
-
-		return average_pitch
+		feature_dicts = [
+			self.get_average_pitch(verbose),
+			self.get_f0_statistics(verbose),
+			self.get_cumulative_speech_index(verbose),
+			self.get_vocal_intensity_statistics(verbose),
+		]
+		merged = dict(ChainMap(*feature_dicts))
+		return merged
 
 

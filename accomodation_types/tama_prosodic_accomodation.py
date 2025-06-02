@@ -1,5 +1,5 @@
 from data_types.transcript_file import TranscriptFile
-from data_types.audio_file import AudioFile
+from audio_features.audio_features import AudioFeatures
 
 class TAMAProsodicAcommodation(object):
 	""" Time Aligned Moving Average (TAMA) analyses the audio in a 
