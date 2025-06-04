@@ -1,212 +1,214 @@
-import pandas as pd
 import numpy as np
-from scipy.stats import pearsonr
-from collections import defaultdict
+from accomodation_types.base_accomodation import BaseAccommodation
 
-import matplotlib.pyplot as plt
+class HYBRIDProsodicAcommodation(BaseAccommodation):
+    '''
+    Hybrid (Utterance‐Sensitive TAMA), uses a single WAV + single CSV.
 
-from data_types.audio_file import AudioFile
-from data_types.transcript_file import TranscriptFile
+    - Start with fixed windows [t₀, t₀ + window_len), hop = self.hop.
+    - For each speaker separately:
+        - Find nearest utterance‐boundary start ≤ t₀,
+            nearest utterance‐boundary end   ≥ (t₀ + window_len).
+        - This yields [sA, eA] for speaker A, [sB, eB] for speaker B.
+        - Extract speaker‐A audio in [sA, eA) and speaker‐B audio in [sB, eB).
+    - For each nominal fixed window [t0, t0+window_len):
+        - Extend that window to whole‐utterance boundaries separately for A and B.
+        - Extract only requested features from each speaker’s extended‐segment.
 
-from audio_features.audio_features import AudioFeatures
-from audio_features.my_voice_analysis_features import MySpeechAnalysisFeatures
+    Convergence and Synchrony are computed exactly as in TAMA.
+        - Convergence: PearsonCorr(|A_t−B_t|, t).
+        - Synchrony: Sliding-window Pearson over A_series vs B_series.
+    '''
 
-class HYBRIDProsodicAcommodation(object):
-	'''
-	class containing all prosocdic accomodation features
-	'''
-	def __init__(self, audio_path:str, diarization_path:str, language_code:str, window_size:int=5, step_size:int=2):
-		self.audio_file = AudioFile(audio_path, language_code) 
-		self.transcript = TranscriptFile(diarization_path, language_code)
-		self.diarization_file = self.transcript.transcript
-		self.language_code = language_code
-		#self.outpath = outpath
-		self.window_size = window_size
-		self.step_size = step_size
+    def __init__(
+        self,
+        audio_path: str,
+        transcript_csv: str,
+        requested_features: list[str] = None,
+        window_len: float = 20.0,
+        hop: float = 10.0,
+        verbose: bool = False
+    ):
+        """
+        :param audio_path: path to mixed-speaker WAV.
+        :param transcript_csv: path to CSV [start,end,text,speaker].
+        :param requested_features: list of features from AudioFeatures.extract().
+        :param window_len: nominal window length (sec).
+        :param hop: hop size (sec).
+        :param verbose: pass to AudioFeatures.extract().
+        """
 
-		self.speaker_1 = self.diarization_file[self.diarization_file["speaker"] == 'SPEAKER 1']
-		self.speaker_2 = self.diarization_file[self.diarization_file["speaker"] == 'SPEAKER 2']
-		
-		#self.accomodation_features = self.get_accomodation()
+        #Initialize BaseAccommodation
+        super().__init__(audio_path, transcript_csv, requested_features=requested_features, verbose=verbose)
+
+        self.window_len = window_len
+        self.hop = hop
+
+        # Precompute nominal window starts
+        self.window_starts = np.arange(
+            0.0, self.duration - self.window_len + 1e-8, self.hop
+        )
+
+        # Store speaker IDs and their utterance lists
+        self.speaker_A = self.speaker_ids[0]
+        self.speaker_B = self.speaker_ids[1]
+
+        # For convenience, grab lists of utterance (start, end) for each speaker
+        # Each utt is a dict { 'start':float, 'end':float, 'text':str }
+        self.utts_A = self.utts_by_speaker[self.speaker_A]
+        self.utts_B = self.utts_by_speaker[self.speaker_B]
+
+    def _extend_window(self, t0: float, t1: float, utts: list[dict]) -> tuple[float, float]:
+        """
+        Given a nominal window [t0, t1), find the nearest full‐utterance boundaries:
+          new_start = max{ utt['start'] ≤ t0 }
+          new_end   = min{ utt['end']   ≥ t1 }
+        If none satisfy, fallback to t0 or t1 respectively.
+        """
+        starts = [u["start"] for u in utts if u["start"] <= t0]
+        new_start = max(starts) if starts else t0
+
+        ends = [u["end"] for u in utts if u["end"] >= t1]
+        new_end = min(ends) if ends else t1
+
+        return new_start, new_end
+
+    def get_accommodation(self) -> dict[str, np.ndarray]:
+        """
+        Returns a dict mapping each requested feature → np.ndarray of shape (nwin, 2):
+          [:,0] = speaker A’s value, [:,1] = speaker B’s value, over nwin windows.
+
+        For each window index i:
+            t0 = self.window_starts[i], t1 = t0 + window_len
+            (sA, eA) = _extend_window(t0, t1, self.utts_A)
+            (sB, eB) = _extend_window(t0, t1, self.utts_B)
+            chunk_A = speaker-A audio in [sA, eA), chunk_B = speaker-B audio in [sB, eB)
+            feats_A = _wrap_and_extract(chunk_A), feats_B = _wrap_and_extract(chunk_B)
+            Fill accom[f][i,0] and accom[f][i,1]
+        """
+        nwin = len(self.window_starts)
+        feat_names = self.requested_features
+
+        accom: dict[str, np.ndarray] = {
+            f: np.zeros((nwin, 2), dtype=float) for f in feat_names
+        }
+
+        for idx, t0 in enumerate(self.window_starts):
+            t1 = t0 + self.window_len
+
+            # compute extended window for speaker A and B
+            sA, eA = self._extend_window(t0, t1, self.utts_A)
+            sB, eB = self._extend_window(t0, t1, self.utts_B)
+
+            # gather each speaker’s audio in [sA,eA) and [sB,eB)
+            chunk_A = self._get_speaker_window_chunk(self.speaker_A, sA, eA)
+            chunk_B = self._get_speaker_window_chunk(self.speaker_B, sB, eB)
+
+            # extract requested features
+            feats_A = self._wrap_and_extract(chunk_A)
+            feats_B = self._wrap_and_extract(chunk_B)
+
+            # 4) fill arrays
+            for f in feat_names:
+                accom[f][idx, 0] = feats_A.get(f, 0.0)
+                accom[f][idx, 1] = feats_B.get(f, 0.0)
+
+        return accom
+
+    def get_convergence(self) -> dict[str, float]:
+        """
+        Exactly as in TAMA: for each feature, let d_i = |A_i − B_i| and t_i = i.
+        Return PearsonCorr(d, t).
+
+        For each feature f:
+          - A_series = accom[f][:,0], B_series = accom[f][:,1]
+          - d = |A_series − B_series|, t = [0..nwin-1]
+          - r = PearsonCorr(d, t). Return { f: r }.
+        """
+        accom = self.get_accommodation()
+        results: dict[str, float] = {}
+        for f in self.requested_features:
+            pairs = accom[f]
+            d = np.abs(pairs[:, 0] - pairs[:, 1])
+            t = np.arange(len(d))
+            results[f] = self._pearsonr(d, t)
+        return results
+
+    def get_synchrony(self, sync_window: int = 5) -> dict[str, np.ndarray]:
+        """
+        Sliding‐window synchrony over the feature‐streams A[·], B[·].
+
+        For each feat, we have A_i and B_i for i=0..nwin−1.
+        For i in 0..(nwin - sync_window):
+          compute r_i = PearsonCorr(A[i:i+sync_window], B[i:i+sync_window])
+        Return arrays of length (nwin - sync_window + 1) for each feature.
+
+        Sliding-window synchrony: For each feature f:
+          - A_series = accom[f][:,0], B_series = accom[f][:,1], length = nwin
+          - r_i = PearsonCorr(A[i:i+sync_window], B[i:i+sync_window]) for i=0..nwin-sync_window
+          - Return array of length (nwin-sync_window+1).
+        """
+        accom = self.get_accommodation()
+        nwin = accom[self.requested_features[0]].shape[0]
+        results: dict[str, np.ndarray] = {}
+
+        for f in self.requested_features:
+            arr = accom[f]
+            A_s = arr[:, 0]
+            B_s = arr[:, 1]
+            rs = []
+            for i in range(nwin - sync_window + 1):
+                segA = A_s[i: i + sync_window]
+                segB = B_s[i: i + sync_window]
+                rs.append(self._pearsonr(segA, segB))
+            results[f] = np.array(rs)
+        return results
 
 
-	def get_features(self, d:dict, verbose:bool=True) -> dict:
-		""" Extracts acoustic features for a diarized window.
+    def get_visualization(self, output_path: str = None):
+        """
+        Plot for each feature:
+         - (A) A_i vs. B_i trajectories (i = window index)
+         - (B) distance |A_i − B_i| vs. window index
+         - Print r_convergence & mean(r_synchrony) for each feature
+        """
 
-        Parameters
-        ----------
-        d : dict
-            Dictionary with 'start' and 'end' times.
+        accom = self.get_accommodation()
+        conv = self.get_convergence()
+        sync = self.get_synchrony()
 
-        Returns
-        -------
-        dict
-            Feature dictionary including start and end times.
-		"""
+        nwin = accom['f0'].shape[0]
+        t = self.window_starts
+        features = ['f0', 'intensity', 'articulation_rate']
 
-		#create audio chunks for each utterance in the transcript.
-		chunk_path = self.audio_file.make_audio_chunk_by_utterance(d['start'], d['end'])
+        fig, axes = plt.subplots(3, 2, figsize=(10, 12))
+        for row, feat in enumerate(features):
+            pairs = accom[feat]
+            A_vals = pairs[:, 0]
+            B_vals = pairs[:, 1]
+            dist = np.abs(A_vals - B_vals)
 
-		#extract features from audio chunk
-		#AF = AudioFeatures(chunk_path, self.language_code)
-		#features = AF.get_all_mysp_features(verbose=verbose)
+            ax1 = axes[row][0]
+            ax1.plot(t, A_vals, '-o', label=f'{self.speaker_A}_{feat}')
+            ax1.plot(t, B_vals, '-s', label=f'{self.speaker_B}_{feat}')
+            ax1.set_title(f'{feat} trajectories (Hybrid)')
+            ax1.legend()
 
-		MSAF = MySpeechAnalysisFeatures(chunk_path, 'audio', self.language_code)
-		#features = MSAF.get_my_voice_analysis_features()
-		raw_features = MSAF.get_my_voice_analysis_features()
-		features = {}
+            ax2 = axes[row][1]
+            ax2.plot(t, dist, '-x', color='gray', label='|A−B|')
+            ax2.set_title(f'{feat} distance per window')
+            ax2.legend()
 
-		#resolve ~the NAN~ issue
-		for k, v in raw_features.items():
-			try:
-				features[k] = float(v)
-			except:
-				features[k] = np.nan
+        plt.tight_layout()
+        if output_path:
+            fig.savefig(output_path)
+        else:
+            plt.show()
 
-		#add start, end, and speaker to utternace features dictionaries
-		features['start'] = d['start']
-		features['end'] =  d['end']
-		return features		
-
-
-	def get_features_by_speaker(self) -> tuple[list[dict], list[dict]]:
-		""" creates a sliding window with fixed window size and step size. Adjusts
-		the window 
-		"""
-
-		#create tmp/ file to hold audio chunks
-		self.audio_file.remove_tmp_file()
-		self.audio_file.create_tmp_file()
-
-		#list to hold features
-		speaker1_hybrid_features = []
-		speaker2_hybrid_features = []
-
-		speaker1_diarize_friendly_windows = self.audio_file.make_diar_friendly_sliding_window(self.speaker_1, duration=self.window_size, step_size=self.step_size)
-		speaker2_diarize_friendly_windows = self.audio_file.make_diar_friendly_sliding_window(self.speaker_2, duration=self.window_size, step_size=self.step_size)
-
-		for d in speaker1_diarize_friendly_windows:
-			#fix this
-			if d['start'] != None:
-				speaker1_hybrid_features.append(self.get_features(d))
-			#print(d)
-		for e in speaker2_diarize_friendly_windows:
-
-			speaker2_hybrid_features.append(self.get_features(e))
-			#print(e)
-
-		#remove audio chunks and tmp/ file	
-		self.audio_file.remove_tmp_file()
-
-		return speaker1_hybrid_features, speaker2_hybrid_features
-
-
-	def sliding_window_correlation(self, speaker1:list[dict], speaker2:list[dict], features:list[str],
-								   window_size:int=50, step_size:int=10) -> tuple[pd.DataFrame, pd.DataFrame, dict, dict]:
-		""" default parameters are based on (De Looze, 2014). 
-			window_size=5
-			step_size=1
-
-		Parameters
-		------------
-		speaker1 : xxx
-			xxx
-		speaker2 : xxx
-			xxx
-		features : list of strings
-			contains names of features that match columns in features dataframe
-		window_size : int
-			default 10
-		step_size : int
-			default 5
-
-		Returns
-		-----------
-		speaker1_df : pandas dataframe
-			xxx
-		speaker2_df : pandas dataframe
-			xxx
-		correlations : list of floats
-			list of correlation values for each window
-		"""
-		#TODO: check speaker length; if len(spk_1) == len(spk_2):
-		speaker1_df = pd.DataFrame(speaker1)
-		speaker2_df = pd.DataFrame(speaker2)
-
-		valid_features = ['mean_F0', 'median_F0', 'sd_F0', 'mean_intensity', 'sd_intensity', 'speech_rate', 'jitter',
-						  'shimmer']
-		features = [f for f in features if
-					f in valid_features and f in speaker1_df.columns and f in speaker2_df.columns]
-
-		# Calculate the Pearson correlation for each window
-		correlations = defaultdict(list)
-		significance = defaultdict(list)
-
-		#iterate through specified feataures
-		for feature in features:
-
-			#subset dataframe by feature
-			speaker1_feature = speaker1_df[feature]
-			speaker2_feature = speaker2_df[feature]
-
-			#offset window size for visualizaion
-			for i in range(0, len(speaker1_df) - window_size + 1, step_size):
-				x_window = speaker1_feature.iloc[i:i + window_size]
-				y_window = speaker2_feature.iloc[i:i + window_size]
-
-				# Try converting and checking
-				try:
-					x_window = x_window.astype(float)
-					y_window = y_window.astype(float)
-
-					if x_window.isnull().any() or y_window.isnull().any():
-						raise ValueError("NaNs present")
-					if x_window.nunique() <= 1 or y_window.nunique() <= 1:
-						raise ValueError("No variation")
-
-					corr, p = pearsonr(x_window, y_window)
-					correlations[feature].append(corr)
-					significance[feature].append(p)
-
-				except Exception as e:
-					correlations[feature].append(np.nan)
-					significance[feature].append(np.nan)
-
-		# return list of correlation values for each window
-		return speaker1_df, speaker2_df, correlations, significance
-	
-
-	def get_convergence(self):
-		"""
-		"""
-		return
-
-	def get_synchrony(self):
-		"""
-		"""
-		return
-
-	def get_visualization(self, data_spk1, data_spk2, accomodation):
-		"""
-		"""
-		#keys = ['speech_rate', 'sd_F0', 'median_F0', 'median_intensity', 'sd_intensity']
-		keys = ['mean_F0']
-		fig, axs = plt.subplots(len(keys), sharex=True, figsize=(5, 5))
-		if len(keys) == 1:
-			axs = [axs]  # wrap single Axes object in a list
-
-		for i,column in enumerate(keys):
-			#X_male = [j[column] for j in data_spk1]
-			#X_female = [j[column] for j in data_spk2]
-			X_male = data_spk1[column].to_numpy()
-			X_female = data_spk2[column].to_numpy()
-
-			# accomodation = accomodation[column][1:]
-			axs[i].plot(X_male, 'blue', label='spk1')
-			axs[i].plot(X_female, 'orange', label='spk2')
-			ax2 = axs[i].twinx()
-			ax2.plot(accomodation[column], 'r--', label='accomodation')
-			ax2.set_ylim([-1, 1])
-			# break
-			axs[i].set_title(column)
-		plt.show()
+        print("=== Hybrid Accommodation Summary ===")
+        for feat in features:
+            mean_sync = np.mean(sync[feat]) if sync[feat].size > 0 else 0.0
+            print(
+                f"{feat.upper()}:   r_convergence = {conv[feat]:.3f}, "
+                f"mean_r_synchrony = {mean_sync:.3f}"
+            )

@@ -1,158 +1,159 @@
-from audio_features.audio_features import AudioFeatures
-from data_types.audio_file import AudioFile
-import pandas as pd
+from accomodation_types.base_accomodation import BaseAccommodation
 import numpy as np
-from scipy.stats import pearsonr
-import os
 
-class TurnLevelProsodicAcommodation(object):
-	'''
-	class containing all turn-level prosocdic accomodation features as described in 
-	"Prosodic Accomodation in Face-to-Face and Telephone Dialogues" by Pavel Sturm, Radek Skarnitzl,
-	Tomas Nechansky
-	'''
-	def __init__(self, audio_path, diarization_path, language_code='fr', outpath=''):
-		"""
-		Parameters
-		-------------
-		audio_path : string
-			path to audio file
-		diarization : string
-			path to speaker diarization file
-		langauge : string 
-			two letter code indicating language
-		outpath : string
-			path where output will be saved
-		"""
+class TurnLevelProsodicAccomodation(BaseAccommodation):
+    """
+    Turn-Taking Prosodic Accommodation.
 
-		self.audio_file = AudioFile(audio_path, language_code) 
-		self.diarization = pd.read_csv(diarization_path)
-		self.language_code = language_code
-		self.outpath = outpath
-		self.accomodation_features = self.get_accomodation()
+    At each turn exchange i:
+      - Take the i-th utterance of speaker A and the i-th utterance of speaker B,
+        extract only the requested features from each chunk, store as (A_i, B_i).
+    Convergence: PearsonCorr(|A_i – B_i|, i).
+    Synchrony: PearsonCorr(A_{i-1}, B_i) over all valid i ≥ 1.
+    """
 
+    def __init__(
+        self,
+        audio_path: str,
+        transcript_csv: str,
+        requested_features: list[str] = None,
+        verbose: bool = False,
+    ):
+        """
+        :param audio_path: path to mixed-speaker WAV.
+        :param transcript_csv: path to CSV with columns [start,end,text,speaker].
+        :param requested_features: list of feature names to extract (e.g. ["mean_f0","mean_intensity"]).
+                                   If None, defaults to ["mean_f0","sd_f0","mean_intensity","syllables_per_second"].
+        :param verbose: If True, pass to AudioFeatures.extract(...) for each chunk.
+        """
+        super().__init__(audio_path, transcript_csv, requested_features=requested_features, verbose=verbose)
 
-	def get_audio_features(self):
-		""" iterates through speech turns. Computes features for each speech turn.
-		
-		Returns
-		---------
-		speech_turn_features : list of dictionaries
-			list of features that map to speech turns
-		"""
-		#create tmp/ file to hold audio chunks
-		self.audio_file.remove_tmp_file()
-		self.audio_file.create_tmp_file()
+        # Identify speaker IDs
+        self.speaker_A = self.speaker_ids[0]
+        self.speaker_B = self.speaker_ids[1]
 
-		#list to hold features
-		speech_turn_features = []
+        # Turn-level uses one utterance per speaker per “exchange index.”
+        self.utts_A = self.utts_by_speaker[self.speaker_A]
+        self.utts_B = self.utts_by_speaker[self.speaker_B]
 
-		#iterate through dataframe of speech turns
-		for speech_turn in self.diarization.iterrows():
-			start_time = speech_turn[1]['start']
-			end_time = speech_turn[1]['end']
-			speaker = speech_turn[1]['speaker']
+    def get_accommodation(self) -> dict[str, np.ndarray]:
+        """
+        Returns a dict mapping each feature → np.ndarray of shape (n_exchanges, 2),
+        where [:,0] = speaker A’s value, [:,1] = speaker B’s value.
 
-			#create audio chunks for each utterance in the transcript.
-			chunk_path = self.audio_file.make_audio_chunk_by_utterance(start_time, end_time)
+        We assume turn-exchange i corresponds to the i-th utterance of A and B.
+        """
+        n_exchanges = min(len(self.utts_A), len(self.utts_B))
+        feat_names = self.requested_features
 
-			#extract features from audio chunk
-			AF = AudioFeatures(chunk_path, self.language_code)
-			features = AF.get_all_features(verbose=False)
+        # Initialize arrays: one (n_exchanges×2) array per feature
+        accom = {f: np.zeros((n_exchanges, 2), dtype=float) for f in feat_names}
 
-			#add start, end, and speaker to utternace features dictionaries
-			features['start'] = start_time
-			features['end'] = end_time
-			features['speaker'] = speaker
+        for idx in range(n_exchanges):
+            utt_A = self.utts_A[idx]
+            utt_B = self.utts_B[idx]
 
-			#append feature dictionary to list
-			speech_turn_features.append(features)
+            # Load raw audio segments for speaker A’s idx-th utterance
+            startA, endA = utt_A["start"], utt_A["end"]
+            chunk_A = self._get_speaker_window_chunk(self.speaker_A, startA, endA)
 
-		#remove audio chunks and tmp/ file	
-		self.audio_file.remove_tmp_file()
+            # Similarly for speaker B
+            startB, endB = utt_B["start"], utt_B["end"]
+            chunk_B = self._get_speaker_window_chunk(self.speaker_B, startB, endB)
 
-		return speech_turn_features
+            # Extract exactly the requested features from each chunk
+            feats_A = self._wrap_and_extract(chunk_A)  # dict: feature→value
+            feats_B = self._wrap_and_extract(chunk_B)
 
+            # Fill the arrays
+            for f in feat_names:
+                accom[f][idx, 0] = feats_A.get(f, 0.0)
+                accom[f][idx, 1] = feats_B.get(f, 0.0)
 
-	def get_speaker_distance(self, features):
-		""" add difference features to accomodation features dataframe.
-		
-		parameters
-		---------
-		features : dict()
-			dictionary of features made in get_audio_features method
+        return accom
 
-		Returns
-		---------
-		df : pandas dataframe
-			pandas dataframe with the 
-		"""
-		df = pd.DataFrame(features)
-		df['pitch_distance'] = df['average_pitch'] - df['average_pitch'].shift(-1)
-		return df
+    def get_convergence(self) -> dict[str, float]:
+        """
+        For each requested feature f:
+          - Let A_series = accom[f][:,0], B_series = accom[f][:,1], length = n_exchanges.
+          - Let d = |A_series – B_series|, t = [0, 1, …, n_exchanges-1].
+          - Return PearsonCorr(d, t).
+        """
+        accom = self.get_accommodation()
+        results: dict[str, float] = {}
+        for f in self.requested_features:
+            pairs = accom[f]  # shape = (n_exchanges, 2)
+            d = np.abs(pairs[:, 0] - pairs[:, 1])
+            t = np.arange(len(d))
+            results[f] = self._pearsonr(d, t)
+        return results
 
+    def get_synchrony(self) -> dict[str, float]:
+        """
+        Turn-Taking synchrony: For each feature f:
+          - Let A_prev = [A_0, A_1, …, A_{n-2}], B_curr = [B_1, …, B_{n-1}].
+          - Return PearsonCorr(A_prev, B_curr). If n_exchanges ≤ 1, return 0.0.
+        """
+        accom = self.get_accommodation()
+        results: dict[str, float] = {}
+        for f in self.requested_features:
+            pairs = accom[f]  # (n_exchanges, 2)
+            n_ex = pairs.shape[0]
+            if n_ex <= 1:
+                results[f] = 0.0
+                continue
+            A_prev = pairs[:-1, 0]
+            B_curr = pairs[1:, 1]
+            results[f] = self._pearsonr(A_prev, B_curr)
+        return results
 
-	def get_accomodation(self):
-		""" extracts features from audio file. Calculates turn-level speaker distances.
+    def get_visualization(self, output_path: str = None):
+        """
+        Plot each feature’s trajectories and distances across turn indices.
+        Then print r_convergence and r_synchrony for each feature.
+        """
+        import matplotlib.pyplot as plt
 
-		Returns
-		---------
-		df : pandas dataframe
-			pandas dataframe with the 
-		"""
-		features = self.get_audio_features()
-		#features['phrase_index'] = features.index
-		distance_features = self.get_speaker_distance(features)
-		distance_features = distance_features.dropna()
-		return distance_features
+        accom = self.get_accommodation()
+        conv = self.get_convergence()
+        sync = self.get_synchrony()
 
+        n_exchanges = accom[self.requested_features[0]].shape[0]
+        t = np.arange(n_exchanges)
+        nf = len(self.requested_features)
 
-	def get_convergence(self):
-		""" get convergence. Pearson correlation be speaker distance and time(i.e. prosodic
-		phrase index/order within the interaction). If speakers converge, the distances
-		should be increasingly smaller with time. This can be captured in an LME model by 
-		using phrase index (proxy for time) as an indicator. Statistical significance of 
-		the predictor would be indicate convergence (if negative).
+        fig, axes = plt.subplots(nf, 2, figsize=(10, 4 * nf))
+        if nf == 1:
+            axes = np.array([[axes[0], axes[1]]])  # ensure 2D
 
-		lme model from Sturm paper: speaker_distance ~ phrase_index + condition + session + (1+condition|speaker_pair)
-	
-		condition (factor): F2F, video call
-		session (factor): session 1, session 2,...
-		phrase_index (continuous): 
-		Preceding Phrase Value (Continuous): 
-		Return
-		----------
-		convergence : xxx
-			pearson correlation between speaker distance and phrase index
-		"""
-		correlation = pearsonr(np.array(self.accomodation_features['pitch_distance']), np.array(self.accomodation_features.index)) 
-		statistic = correlation[0]
-		pvalue = correlation[1]
-		return statistic, pvalue
+        for row, f in enumerate(self.requested_features):
+            A_vals = accom[f][:, 0]
+            B_vals = accom[f][:, 1]
+            dist = np.abs(A_vals - B_vals)
 
+            ax1 = axes[row, 0]
+            ax1.plot(t, A_vals, "-o", label=f"{self.speaker_A}_{f}")
+            ax1.plot(t, B_vals, "-s", label=f"{self.speaker_B}_{f}")
+            ax1.set_title(f"{f} trajectories (Turn-Taking)")
+            ax1.set_xlabel("Turn Index")
+            ax1.set_ylabel(f"{f}")
+            ax1.legend()
 
-	def get_synchrony(self):
-		"""
-		lme model from Sturm paper: turn-initial value ~ preceding phrase value + condition + session + (1+condition|speaker_pair) + (1+condition|speaker)
-		
-		Returns
-		---------
-		correlation : pearsonRResult
+            ax2 = axes[row, 1]
+            ax2.plot(t, dist, "-x", color="gray", label="|A−B|")
+            ax2.set_title(f"{f} |A−B| per turn")
+            ax2.set_xlabel("Turn Index")
+            ax2.set_ylabel("Distance")
+            ax2.legend()
 
-		"""
-		SPEAKER1 = self.accomodation_features.loc[self.accomodation_features['speaker'] == 'SPEAKER 1']
-		SPEAKER2 = self.accomodation_features.loc[self.accomodation_features['speaker'] == 'SPEAKER 2']
+        plt.tight_layout()
+        if output_path:
+            fig.savefig(output_path)
+        else:
+            plt.show()
 
-		sp1 = np.array(SPEAKER2['average_pitch'])
-		sp2 = np.array(SPEAKER1['average_pitch'])
-
-		if len(sp1) != len(sp2):
-			if len(sp1) > len(sp2):
-				sp1 = sp1[:-1]
-			else:
-				sp2 = sp2[:-1]
-
-		correlation = pearsonr(sp1, sp2)
-		statistic = correlation[0]
-		pvalue = correlation[1]
-		return statistic, pvalue
+        print("\n=== Turn-Taking Accommodation Summary ===")
+        for f in self.requested_features:
+            r_conv = conv[f]
+            r_sync = sync[f]
+            print(f"{f}:   r_convergence = {r_conv:.4f},   r_synchrony = {r_sync:.4f}")

@@ -20,7 +20,10 @@ class AudioFile(object):
 	"""Audio file in wav format. 
 	"""
 
-	def __init__(self, path, language):
+	def __init__(self,
+		path,
+		language
+	):
 		"""
 		Parameters
 		-----------
