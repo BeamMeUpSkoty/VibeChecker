@@ -1,5 +1,7 @@
 import numpy as np
 from accomodation_types.base_accomodation import BaseAccommodation
+import matplotlib.pyplot as plt
+from typing import Dict, List
 
 class HYBRIDProsodicAcommodation(BaseAccommodation):
     '''
@@ -58,6 +60,9 @@ class HYBRIDProsodicAcommodation(BaseAccommodation):
         self.utts_A = self.utts_by_speaker[self.speaker_A]
         self.utts_B = self.utts_by_speaker[self.speaker_B]
 
+        # Cached feature matrix: dict[feature] = np.ndarray shape (nwin, 2)
+        self._accom_cache: Dict[str, np.ndarray] = {}
+
     def _extend_window(self, t0: float, t1: float, utts: list[dict]) -> tuple[float, float]:
         """
         Given a nominal window [t0, t1), find the nearest full‐utterance boundaries:
@@ -86,12 +91,14 @@ class HYBRIDProsodicAcommodation(BaseAccommodation):
             feats_A = _wrap_and_extract(chunk_A), feats_B = _wrap_and_extract(chunk_B)
             Fill accom[f][i,0] and accom[f][i,1]
         """
+        # Build cache on first call
+        if self._accom_cache:
+            return self._accom_cache
+
         nwin = len(self.window_starts)
         feat_names = self.requested_features
 
-        accom: dict[str, np.ndarray] = {
-            f: np.zeros((nwin, 2), dtype=float) for f in feat_names
-        }
+        accom = {f: np.zeros((nwin, 2), dtype=float) for f in feat_names}
 
         for idx, t0 in enumerate(self.window_starts):
             t1 = t0 + self.window_len
@@ -113,6 +120,7 @@ class HYBRIDProsodicAcommodation(BaseAccommodation):
                 accom[f][idx, 0] = feats_A.get(f, 0.0)
                 accom[f][idx, 1] = feats_B.get(f, 0.0)
 
+        self._accom_cache = accom
         return accom
 
     def get_convergence(self) -> dict[str, float]:
@@ -126,12 +134,17 @@ class HYBRIDProsodicAcommodation(BaseAccommodation):
           - r = PearsonCorr(d, t). Return { f: r }.
         """
         accom = self.get_accommodation()
-        results: dict[str, float] = {}
-        for f in self.requested_features:
-            pairs = accom[f]
+        results: Dict[str, float] = {}
+        for f, pairs in accom.items():
+            # difference series
             d = np.abs(pairs[:, 0] - pairs[:, 1])
+            # vectorized correlation with time index
             t = np.arange(len(d))
-            results[f] = self._pearsonr(d, t)
+            if np.std(d) == 0 or np.std(t) == 0:
+                results[f] = 0.0
+            else:
+                corr = np.corrcoef(d, t)[0, 1]
+                results[f] = float(corr)
         return results
 
     def get_synchrony(self, sync_window: int = 5) -> dict[str, np.ndarray]:
@@ -149,66 +162,90 @@ class HYBRIDProsodicAcommodation(BaseAccommodation):
           - Return array of length (nwin-sync_window+1).
         """
         accom = self.get_accommodation()
-        nwin = accom[self.requested_features[0]].shape[0]
-        results: dict[str, np.ndarray] = {}
-
-        for f in self.requested_features:
-            arr = accom[f]
-            A_s = arr[:, 0]
-            B_s = arr[:, 1]
-            rs = []
-            for i in range(nwin - sync_window + 1):
-                segA = A_s[i: i + sync_window]
-                segB = B_s[i: i + sync_window]
-                rs.append(self._pearsonr(segA, segB))
-            results[f] = np.array(rs)
+        results: Dict[str, np.ndarray] = {}
+        for f, pairs in accom.items():
+            A_s = pairs[:, 0]
+            B_s = pairs[:, 1]
+            nwin = len(A_s)
+            if nwin < sync_window:
+                results[f] = np.array([])
+                continue
+            # build rolling windows matrix
+            shape = (nwin - sync_window + 1, sync_window)
+            strides = (A_s.strides[0], A_s.strides[0])
+            A_windows = np.lib.stride_tricks.as_strided(A_s, shape=shape, strides=strides)
+            B_windows = np.lib.stride_tricks.as_strided(B_s, shape=shape, strides=strides)
+            # compute correlation per row
+            # vectorized: subtract means, compute dot/div
+            A_mean = A_windows.mean(axis=1, keepdims=True)
+            B_mean = B_windows.mean(axis=1, keepdims=True)
+            A_d = A_windows - A_mean
+            B_d = B_windows - B_mean
+            num = np.sum(A_d * B_d, axis=1)
+            den = np.sqrt(np.sum(A_d**2, axis=1) * np.sum(B_d**2, axis=1))
+            r = np.divide(num, den, out=np.zeros_like(num), where=den!=0)
+            results[f] = r
         return results
 
-
+    '''
     def get_visualization(self, output_path: str = None):
         """
-        Plot for each feature:
+        Plot for each requested feature:
          - (A) A_i vs. B_i trajectories (i = window index)
          - (B) distance |A_i − B_i| vs. window index
          - Print r_convergence & mean(r_synchrony) for each feature
         """
 
-        accom = self.get_accommodation()
-        conv = self.get_convergence()
-        sync = self.get_synchrony()
+        # 1) Recompute accommodation, convergence, and synchrony
+        accom = self.get_accommodation()            # dict[f] → (nwin×2) array
+        conv = self.get_convergence()               # dict[f] → single float
+        sync = self.get_synchrony()                 # dict[f] → array of length (nwin − sync_window + 1)
 
-        nwin = accom['f0'].shape[0]
-        t = self.window_starts
-        features = ['f0', 'intensity', 'articulation_rate']
+        nwin = accom[self.requested_features[0]].shape[0]
+        t = self.window_starts                       # array of length nwin
 
-        fig, axes = plt.subplots(3, 2, figsize=(10, 12))
-        for row, feat in enumerate(features):
-            pairs = accom[feat]
+        # Create a row of 2 subplots per feature
+        n_feats = len(self.requested_features)
+        fig, axes = plt.subplots(n_feats, 2, figsize=(10, 4 * n_feats))
+
+        for row, feat in enumerate(self.requested_features):
+            pairs = accom[feat]                      # shape: (nwin, 2)
             A_vals = pairs[:, 0]
             B_vals = pairs[:, 1]
             dist = np.abs(A_vals - B_vals)
 
-            ax1 = axes[row][0]
+            # Trajectories subplot (left)
+            ax1 = axes[row][0] if n_feats > 1 else axes[0]
             ax1.plot(t, A_vals, '-o', label=f'{self.speaker_A}_{feat}')
             ax1.plot(t, B_vals, '-s', label=f'{self.speaker_B}_{feat}')
             ax1.set_title(f'{feat} trajectories (Hybrid)')
-            ax1.legend()
+            ax1.set_xlabel('Time (s)')
+            ax1.set_ylabel(feat)
+            ax1.legend(loc='best', fontsize='small')
 
-            ax2 = axes[row][1]
-            ax2.plot(t, dist, '-x', color='gray', label='|A−B|')
+            # Distance subplot (right)
+            ax2 = axes[row][1] if n_feats > 1 else axes[1]
+            ax2.plot(t, dist, '-x', color='gray', label=f'|{self.speaker_A}−{self.speaker_B}|')
             ax2.set_title(f'{feat} distance per window')
-            ax2.legend()
+            ax2.set_xlabel('Time (s)')
+            ax2.set_ylabel(f'|Δ_{feat}|')
+            ax2.legend(loc='best', fontsize='small')
 
         plt.tight_layout()
+
+        # Save or show
         if output_path:
             fig.savefig(output_path)
+            plt.close(fig)
         else:
             plt.show()
 
+        # Print summary numbers
         print("=== Hybrid Accommodation Summary ===")
-        for feat in features:
-            mean_sync = np.mean(sync[feat]) if sync[feat].size > 0 else 0.0
+        for feat in self.requested_features:
+            mean_rsync = float(np.mean(sync[feat])) if sync[feat].size > 0 else 0.0
             print(
-                f"{feat.upper()}:   r_convergence = {conv[feat]:.3f}, "
-                f"mean_r_synchrony = {mean_sync:.3f}"
+                f"{feat.upper():<20}  r_convergence = {conv[feat]:.3f}   "
+                f"mean_r_synchrony = {mean_rsync:.3f}"
             )
+    '''

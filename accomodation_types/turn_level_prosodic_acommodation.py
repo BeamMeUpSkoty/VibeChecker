@@ -1,5 +1,9 @@
 from accomodation_types.base_accomodation import BaseAccommodation
 import numpy as np
+from typing import Dict, List
+import matplotlib.pyplot as plt
+from statsmodels.nonparametric.smoothers_lowess import lowess
+
 
 class TurnLevelProsodicAccomodation(BaseAccommodation):
     """
@@ -35,6 +39,8 @@ class TurnLevelProsodicAccomodation(BaseAccommodation):
         # Turn-level uses one utterance per speaker per “exchange index.”
         self.utts_A = self.utts_by_speaker[self.speaker_A]
         self.utts_B = self.utts_by_speaker[self.speaker_B]
+        # cache for per-turn features
+        self._accom_cache: Dict[str, np.ndarray] = {}
 
     def get_accommodation(self) -> dict[str, np.ndarray]:
         """
@@ -43,6 +49,10 @@ class TurnLevelProsodicAccomodation(BaseAccommodation):
 
         We assume turn-exchange i corresponds to the i-th utterance of A and B.
         """
+        # return cached if exists
+        if self._accom_cache:
+            return self._accom_cache
+
         n_exchanges = min(len(self.utts_A), len(self.utts_B))
         feat_names = self.requested_features
 
@@ -70,6 +80,7 @@ class TurnLevelProsodicAccomodation(BaseAccommodation):
                 accom[f][idx, 0] = feats_A.get(f, 0.0)
                 accom[f][idx, 1] = feats_B.get(f, 0.0)
 
+        self._accom_cache = accom
         return accom
 
     def get_convergence(self) -> dict[str, float]:
@@ -80,12 +91,16 @@ class TurnLevelProsodicAccomodation(BaseAccommodation):
           - Return PearsonCorr(d, t).
         """
         accom = self.get_accommodation()
-        results: dict[str, float] = {}
-        for f in self.requested_features:
-            pairs = accom[f]  # shape = (n_exchanges, 2)
-            d = np.abs(pairs[:, 0] - pairs[:, 1])
-            t = np.arange(len(d))
-            results[f] = self._pearsonr(d, t)
+        results: Dict[str, float] = {}
+        # vector of exchange indices
+        t = np.arange(next(iter(accom.values())).shape[0])
+        for f, pairs in accom.items():
+            d = np.abs(pairs[:,0] - pairs[:,1])
+            if d.size < 2 or np.std(d)==0 or np.std(t)==0:
+                corr = 0.0
+            else:
+                corr = float(np.corrcoef(d, t)[0,1])
+            results[f] = corr
         return results
 
     def get_synchrony(self) -> dict[str, float]:
@@ -95,25 +110,23 @@ class TurnLevelProsodicAccomodation(BaseAccommodation):
           - Return PearsonCorr(A_prev, B_curr). If n_exchanges ≤ 1, return 0.0.
         """
         accom = self.get_accommodation()
-        results: dict[str, float] = {}
-        for f in self.requested_features:
-            pairs = accom[f]  # (n_exchanges, 2)
-            n_ex = pairs.shape[0]
-            if n_ex <= 1:
-                results[f] = 0.0
-                continue
-            A_prev = pairs[:-1, 0]
-            B_curr = pairs[1:, 1]
-            results[f] = self._pearsonr(A_prev, B_curr)
+        results: Dict[str, float] = {}
+        for f, pairs in accom.items():
+            A_vals = pairs[:-1,0]
+            B_vals = pairs[1:,1]
+            if A_vals.size < 1 or np.std(A_vals)==0 or np.std(B_vals)==0:
+                corr = 0.0
+            else:
+                corr = float(np.corrcoef(A_vals, B_vals)[0,1])
+            results[f] = corr
         return results
 
-    def get_visualization(self, output_path: str = None):
+    '''
+    def get_visualization(self, output_path: str = None, loess_frac: float = 0.3):
         """
-        Plot each feature’s trajectories and distances across turn indices.
-        Then print r_convergence and r_synchrony for each feature.
+        Plot each feature’s trajectories and distances across turn indices,
+        then overlay LOESS‐smoothed curves and print r_convergence and r_synchrony.
         """
-        import matplotlib.pyplot as plt
-
         accom = self.get_accommodation()
         conv = self.get_convergence()
         sync = self.get_synchrony()
@@ -131,16 +144,36 @@ class TurnLevelProsodicAccomodation(BaseAccommodation):
             B_vals = accom[f][:, 1]
             dist = np.abs(A_vals - B_vals)
 
+            # —— Trajectories subplot —— #
             ax1 = axes[row, 0]
-            ax1.plot(t, A_vals, "-o", label=f"{self.speaker_A}_{f}")
-            ax1.plot(t, B_vals, "-s", label=f"{self.speaker_B}_{f}")
-            ax1.set_title(f"{f} trajectories (Turn-Taking)")
+            ax1.plot(t, A_vals, "-o", label=f"{self.speaker_A}_{f}", alpha=0.6)
+            ax1.plot(t, B_vals, "-s", label=f"{self.speaker_B}_{f}", alpha=0.6)
+
+            # compute & plot LOESS for A and B
+            lo_A = lowess(endog=A_vals, exog=t, frac=loess_frac, return_sorted=True)
+            lo_B = lowess(endog=B_vals, exog=t, frac=loess_frac, return_sorted=True)
+            ax1.plot(lo_A[:, 0], lo_A[:, 1],
+                     linestyle="--", linewidth=2,
+                     label=f"{self.speaker_A}_{f} (LOESS)")
+            ax1.plot(lo_B[:, 0], lo_B[:, 1],
+                     linestyle="--", linewidth=2,
+                     label=f"{self.speaker_B}_{f} (LOESS)")
+
+            ax1.set_title(f"{f} trajectories (Turn‐Taking)")
             ax1.set_xlabel("Turn Index")
-            ax1.set_ylabel(f"{f}")
+            ax1.set_ylabel(f)
             ax1.legend()
 
+            # —— Distance subplot —— #
             ax2 = axes[row, 1]
-            ax2.plot(t, dist, "-x", color="gray", label="|A−B|")
+            ax2.plot(t, dist, "-x", color="gray", label="|A−B|", alpha=0.6)
+
+            # compute & plot LOESS for distance
+            lo_D = lowess(endog=dist, exog=t, frac=loess_frac, return_sorted=True)
+            ax2.plot(lo_D[:, 0], lo_D[:, 1],
+                     linestyle="--", linewidth=2,
+                     label="|A−B| (LOESS)")
+
             ax2.set_title(f"{f} |A−B| per turn")
             ax2.set_xlabel("Turn Index")
             ax2.set_ylabel("Distance")
@@ -157,3 +190,4 @@ class TurnLevelProsodicAccomodation(BaseAccommodation):
             r_conv = conv[f]
             r_sync = sync[f]
             print(f"{f}:   r_convergence = {r_conv:.4f},   r_synchrony = {r_sync:.4f}")
+        '''

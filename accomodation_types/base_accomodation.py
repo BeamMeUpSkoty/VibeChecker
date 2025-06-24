@@ -3,8 +3,11 @@ import csv
 import numpy as np
 import soundfile as sf
 from typing import List, Dict
+from scipy.stats import pearsonr
+import matplotlib.pyplot as plt
+from statsmodels.nonparametric.smoothers_lowess import lowess
 
-from audio_features.audio_features import AudioFeatures
+from audio_features.audio_features_optimized import AudioFeaturesOptimized
 
 class BaseAccommodation(ABC):
     """
@@ -34,6 +37,7 @@ class BaseAccommodation(ABC):
         audio_path: str,
         transcript_csv: str,
         requested_features: List[str] = None,
+        frame_duration: float = 10.0,
         verbose: bool = False,
     ):
         """
@@ -42,11 +46,13 @@ class BaseAccommodation(ABC):
         :param requested_features:
                    list of feature‐names to extract (must match keys from AudioFeatures.extract()).
                    If None, defaults to ['mean_f0','mean_intensity','syllables_per_second'].
+        : param frame_duration:
         :param verbose:           pass to feature extractor if you want prints.
         """
 
         self.audio_path = audio_path
         self.transcript_csv = transcript_csv
+        self.frame_duration = frame_duration
         self.verbose = verbose
 
         # Load entire audio
@@ -83,6 +89,7 @@ class BaseAccommodation(ABC):
                 f"Transcript CSV must have exactly two speaker labels; found {len(speakers)}: {speakers}"
             )
         self.speaker_ids = speakers  # e.g. ['A', 'B']
+        self.speaker_A, self.speaker_B = self.speaker_ids
 
         # Split utterances by speaker
         self.utts_by_speaker = {
@@ -141,37 +148,6 @@ class BaseAccommodation(ABC):
         """
         pass
 
-    @abstractmethod
-    def get_synchrony(self) -> dict:
-        """
-        Compute local/short‐term synchrony per feature.
-        Typically, for each feature we have two parallel time‐series (A_t, B_t).  Then:
-          – Either compute one global PearsonCorr(A[:-1], B[1:]) (turn‐taking style),
-          – Or compute a sliding‐window PearsonCorr(A[t:t+W], B[t:t+W]) (TAMA/hybrid style).
-
-        Returns:
-          {
-            'f0': np.ndarray(...),
-            'intensity': np.ndarray(...),
-            'articulation_rate': np.ndarray(...)
-          }
-        The length and interpretation of each array depend on the subclass’s chosen windowing.
-        """
-        pass
-
-    @abstractmethod
-    def get_visualization(self, output_path: str = None):
-        """
-        Produce diagnostic plots:
-          - Raw feature trajectories for both speakers over time‐steps for each requested feature f.
-          - Distance (|A_t−B_t|) vs. time‐step.
-          - If sliding‐window, the synchrony curve vs. time‐step.
-
-        If output_path is provided, save the figure there; otherwise, display on screen.
-
-        """
-        pass
-
     def _pearsonr(self, x: np.ndarray, y: np.ndarray) -> float:
         """
         Compute Pearson’s r between 1D arrays x and y.  If denominator is zero, returns 0.0.
@@ -200,7 +176,6 @@ class BaseAccommodation(ABC):
 
     def _get_speaker_window_chunk(self, speaker: str, t0: float, t1: float) -> np.ndarray:
         """
-        TODO: See if this method changed.
         Return a 1D np.ndarray of all audio samples (concatenated) for `speaker`
         that overlap the interval [t0, t1).  We look at each utterance in
         self.utts_by_speaker[speaker], clip it to [t0, t1), slice from self.audio,
@@ -235,5 +210,241 @@ class BaseAccommodation(ABC):
             # if empty chunk, return 0.0 for all requested_features
             return {f: 0.0 for f in self.requested_features}
 
-        af = AudioFeatures(array=array_chunk, sr=self.sr)
+        af = AudioFeaturesOptimized(array=array_chunk, sr=self.sr)
         return af.extract(self.requested_features, verbose=self.verbose)
+
+    def dynamic_synchrony(self, A_vals: np.ndarray, B_vals: np.ndarray, window: int = 10, hop: int = 5):
+        """
+        Slide a window of `window` frames, hop by `hop`, compute Pearson-r.
+
+        Returns:
+          rs    : np.ndarray of correlation values
+          times : np.ndarray of midpoint times in seconds
+        """
+        n = len(A_vals)
+        rs, times = [], []
+        for start in range(0, n - window + 1, hop):
+            segA = A_vals[start:start+window]
+            segB = B_vals[start:start+window]
+            r, _ = pearsonr(segA, segB)
+            rs.append(r)
+            mid = (start + window / 2) * self.frame_duration
+            times.append(mid)
+        return np.array(rs), np.array(times)
+
+    def phase_metrics(self, rs: np.ndarray, window: int = 10) -> Dict[str, float]:
+        """
+        Count & sum time in phases based on rs thresholds:
+          - synchrony   : r >=  0.5
+          - asynchrony : r <= -0.5
+          - maintenance: otherwise
+        """
+        sync_mask  = rs >=  0.5
+        async_mask = rs <= -0.5
+        maint_mask = ~(sync_mask | async_mask)
+        n_sync, n_async, n_maint = sync_mask.sum(), async_mask.sum(), maint_mask.sum()
+        t_sync  = n_sync  * window * self.frame_duration
+        t_async = n_async * window * self.frame_duration
+        t_maint = n_maint * window * self.frame_duration
+        return {
+            'n_sync': n_sync,   'time_sync':  t_sync,
+            'n_async': n_async, 'time_async': t_async,
+            'n_maint': n_maint, 'time_maint': t_maint,
+        }
+
+    def get_synchrony_features(self) -> Dict[str, Dict]:
+        """
+        Compute dynamic-synchrony metrics and phases for each requested feature.
+        Returns a dict mapping feature -> stats dict including r_values and r_times.
+        """
+        accom = self.get_accommodation()
+        out = {}
+        for f in self.requested_features:
+            A, B      = accom[f][:,0], accom[f][:,1]
+            rs, times = self.dynamic_synchrony(A, B)
+            stats     = self.phase_metrics(rs)
+            out[f]    = {**stats, 'r_values': rs, 'r_times': times}
+        return out
+
+    def get_state_features(self,
+                           window: int = 10,
+                           hop: int = 5,
+                           thresh: float = 0.5
+                          ) -> Dict[str, np.ndarray]:
+        """
+        For each requested feature, compute the sequence of 1–7 “states”
+        across the interaction.
+        Returns a dict: feature → array of state‐IDs.
+        """
+        accom = self.get_accommodation()
+        out = {}
+        for f in self.requested_features:
+            A = accom[f][:,0]
+            B = accom[f][:,1]
+            out[f] = self.dynamic_states(A, B,
+                                        window=window,
+                                        hop=hop,
+                                        thresh=thresh)
+        return out
+
+    def dynamic_states(self,
+                       A_vals: np.ndarray,
+                       B_vals: np.ndarray,
+                       window: int = 10,
+                       hop: int = 5,
+                       thresh: float = 0.5
+                      ) -> np.ndarray:
+        """
+        Slide (window×hop) over A_vals, B_vals and return for each window
+        an integer 1–7 corresponding to the De Looze “state”:
+          1=maintenance,
+          2=synchrony,
+          3=convergence,
+          4=synchrony+convergence,
+          5=asynchrony,
+          6=divergence,
+          7=asynchrony+divergence
+        """
+        n = len(A_vals)
+        d = np.abs(A_vals - B_vals)
+        states = []
+        for start in range(0, n - window + 1, hop):
+            segA = A_vals[start:start+window]
+            segB = B_vals[start:start+window]
+            segD =    d[start:start+window]
+            # synchrony / asynchrony
+            r_sync, _ = pearsonr(segA, segB)
+            is_sync  = r_sync >=  thresh
+            is_async = r_sync <= -thresh
+            # convergence / divergence
+            idxs = np.arange(window)
+            r_conv, _ = pearsonr(segD, idxs)
+            is_conv  = r_conv <= -thresh
+            is_div   = r_conv >=  thresh
+
+            # map to state ID
+            if   not any((is_sync, is_async, is_conv, is_div)):
+                state = 1
+            elif  is_sync  and  is_conv:
+                state = 4
+            elif  is_sync:
+                state = 2
+            elif  is_conv:
+                state = 3
+            elif  is_async and  is_div:
+                state = 7
+            elif  is_async:
+                state = 5
+            elif  is_div:
+                state = 6
+            else:
+                state = 1
+            states.append(state)
+        return np.array(states)
+
+    def get_visualization(
+            self,
+            output_path: str = None,
+            loess_frac: float = None,
+            window: int = 10,
+            hop: int = 5,
+            thresh: float = 0.5,
+    ):
+        """
+        Default 4-column visualization for each requested feature:
+          1) A vs. B trajectories per time-step
+          2) |A−B| distance per time-step
+          3) dynamic synchrony r(t) with red/green shaded spans
+          4) seven “states of accommodation” (maintenance, synchrony, convergence,
+             synchrony+convergence, asynchrony, divergence, asynchrony+divergence)
+        """
+        # 1. get data
+        accom = self.get_accommodation()
+        sync_feats = self.get_synchrony_features()
+        state_feats = self.get_state_features(window, hop, thresh)
+
+        # 2. layout
+        n_steps = next(iter(accom.values())).shape[0]
+        t_index = np.arange(n_steps)
+        nf = len(self.requested_features)
+
+        fig, axes = plt.subplots(nf, 4, figsize=(20, 4 * nf))
+        if nf == 1:
+            axes = np.array([axes])
+
+        # 3. loop over features
+        for row, f in enumerate(self.requested_features):
+            A = accom[f][:, 0]
+            B = accom[f][:, 1]
+            dist = np.abs(A - B)
+
+            # dynamic synchrony
+            rs, times = sync_feats[f]['r_values'], sync_feats[f]['r_times']
+
+            # accommodation states (1–7)
+            states = state_feats[f]
+
+            # — col 0: trajectories —
+            ax0 = axes[row, 0]
+            ax0.plot(t_index, A, '-o', alpha=0.6, label=f"{self.speaker_A}_{f}")
+            ax0.plot(t_index, B, '-s', alpha=0.6, label=f"{self.speaker_B}_{f}")
+            ax0.set(title=f"{f} trajectories", xlabel="Time-step", ylabel=f)
+            ax0.legend()
+
+            if loess_frac is not None:
+                lo_A = lowess(endog=A, exog=t_index, frac=loess_frac, return_sorted=True)
+                lo_B = lowess(endog=B, exog=t_index, frac=loess_frac, return_sorted=True)
+                ax0.plot(lo_A[:, 0], lo_A[:, 1],
+                         linestyle='--', linewidth=2, label=f"{self.speaker_A} (LOESS)")
+                ax0.plot(lo_B[:, 0], lo_B[:, 1],
+                         linestyle='--', linewidth=2, label=f"{self.speaker_B} (LOESS)")
+                ax0.legend()
+
+            # — col 1: distance —
+            ax1 = axes[row, 1]
+            ax1.plot(t_index, dist, '-x', color='gray', alpha=0.6)
+            ax1.set(title=f"{f} |A−B|", xlabel="Time-step", ylabel="Distance")
+
+            # — col 2: dynamic synchrony —
+            ax2 = axes[row, 2]
+            ax2.plot(times, rs, '-o', label='r (Pearson)')
+            half_win = (window * self.frame_duration) / 2
+            for r_val, mid in zip(rs, times):
+                start, end = mid - half_win, mid + half_win
+                if r_val >= thresh:
+                    ax2.axvspan(start, end, color='red', alpha=0.3)
+                elif r_val <= -thresh:
+                    ax2.axvspan(start, end, color='green', alpha=0.3)
+            ax2.axhline(thresh, linestyle='--', color='red')
+            ax2.axhline(-thresh, linestyle='--', color='green')
+            ax2.set(title=f"{f} dynamic synchrony", xlabel="Time (s)", ylabel="r")
+            ax2.legend(loc='upper right')
+
+            # — col 3: accommodation states —
+            ax3 = axes[row, 3]
+            # scatter state IDs over time for simplicity
+            # map state IDs to integers 1–7 on the y-axis
+            state_times = (np.arange(len(states)) + window / 2) * self.frame_duration
+            ax3.scatter(state_times, states, c=states, cmap='tab10', s=50)
+            ax3.set(
+                title=f"{f} accommodation states",
+                xlabel="Time (s)",
+                ylabel="State ID",
+                yticks=[1, 2, 3, 4, 5, 6, 7],
+            )
+            # optionally annotate the legend manually:
+            ax3.legend([
+                "1: maintenance",
+                "2: synchrony",
+                "3: convergence",
+                "4: sync+conv",
+                "5: asynchrony",
+                "6: divergence",
+                "7: async+div"
+            ], loc='upper right', fontsize='small')
+
+        plt.tight_layout()
+        if output_path:
+            fig.savefig(output_path)
+        else:
+            plt.show()

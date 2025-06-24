@@ -1,174 +1,204 @@
-'''
-created on April 3, 2023
+#!/usr/bin/env python3
 
-@author: hali02
-'''
 import os
-import fire
+import pickle
+import click
+import csv as _csv
+import numpy as np
+from audio_features.audio_features_optimized import AudioFeaturesOptimized
 
 from accomodation_types.turn_level_prosodic_acommodation import TurnLevelProsodicAccomodation
 from accomodation_types.hybrid_prosodic_acomodation import HYBRIDProsodicAcommodation
 from accomodation_types.tama_prosodic_accomodation import TAMAProsodicAcommodation
 
-class ProsodicAccommodation(object):
+@click.group()
+@click.version_option(version='1.0', prog_name='prosodic-accommodation')
+def cli():
     """
-    Wrapper class to run different prosodic accommodation pipelines.
+    Prosodic Accommodation CLI
 
-    Usage (CLI):
-      python prosodic_accommodation_pipeline.py \
-        --audio_path path/to/audio.wav \
-        --transcript_csv path/to/transcript.csv \
-        --results_path path/to/results_dir \
-        --accommodation_type turn_taking \
-        --features mean_f0,sd_f0,mean_intensity \
-        --visualize True \
-        --verbose False
+    Use 'run' to execute analyses or 'list-features' to see available prosodic features.
     """
+    pass
 
-    def __init__(
-        self,
-        audio_path: str,
-        transcript_csv: str,
-        results_path: str = "",
-        accommodation_type: str = "turn_level",
-        features: str = "",
-        visualize: bool = True,
-        verbose: bool = False,
-    ):
-        """
-        :param audio_path:         Path to the mixed-speaker WAV file.
-        :param transcript_csv:     Path to CSV with columns [start,end,text,speaker].
-        :param results_path:       Directory where plots/results will be saved (optional).
-        :param accommodation_type: One of {'turn_taking','hybrid'}.
-        :param features:           Comma-separated list of feature keys from AudioFeatures.extract(),
-                                  e.g. "mean_f0,sd_f0,mean_intensity". If empty, defaults are used.
-        :param visualize:          If True, call get_visualization(...).
-        :param verbose:            If True, pass verbose=True into AudioFeatures.extract().
-        """
-        self.audio_path = audio_path
-        self.transcript_csv = transcript_csv
-        self.results_path = results_path.rstrip("/")  # remove trailing slash if present
-        self.accommodation_type = accommodation_type.lower()
-        self.visualize = visualize
-        self.verbose = verbose
+@cli.command()
+@click.argument('audio_path', type=click.Path(exists=True, file_okay=True, dir_okay=True))
+@click.argument('transcript_path', type=click.Path(exists=True, file_okay=True, dir_okay=True))
+@click.option('--accommodation-type', '-t',
+              type=click.Choice(['turn_level', 'hybrid', 'tama']),
+              default='turn_level', show_default=True,
+              help='Type of accommodation analysis to perform')
+@click.option('--features', '-f', default='',
+              help='Comma-separated list of prosodic features (default: all)')
+@click.option('--results-path', '-r', default='results/', show_default=True,
+              type=click.Path(), help='Base directory to save results and plots')
+@click.option('--no-viz', 'visualize', flag_value=False, default=True,
+              help='Skip generating visualizations')
+@click.option('--verbose', '-v', is_flag=False,
+              help='Enable verbose logging')
+@click.option('--synchrony-mode',
+              type=click.Choice(['turn', 'dynamic', 'combined']),
+              default='turn', show_default=True,
+              help='(Turn-level only) synchrony mode')
+@click.option('--win-frames', type=int, default=10, show_default=True,
+              help='Sliding-window length in frames')
+@click.option('--hop-frames', type=int, default=5, show_default=True,
+              help='Sliding-window hop in frames')
+@click.option('--state-thresh', type=float, default=0.5, show_default=True,
+              help='Threshold for synchrony/asynchrony and convergence/divergence')
+@click.option('--loess-frac', type=float, default=0.3, show_default=True,
+              help='LOESS smoothing fraction for plots')
+def run(
+    audio_path,
+    transcript_path,
+    accommodation_type,
+    features,
+    results_path,
+    visualize,
+    verbose,
+    synchrony_mode,
+    win_frames,
+    hop_frames,
+    state_thresh,
+    loess_frac
+):
+    """
+    Execute prosodic accommodation analysis on a single file or batch in directories.
 
-        # at the top of prosodic_accomodation_pipeline.py __init__:
-        if isinstance(features, (list, tuple)):
-            # join a tuple/list into a comma string
-            features_str = ",".join(features)
+    AUDIO_PATH: path to WAV file or directory of WAVs
+    TRANSCRIPT_PATH: path to CSV file or directory of CSVs
+    """
+    # Parse features list
+    feats = None
+    if features:
+        feats = [f.strip() for f in features.split(',') if f.strip()]
+
+    # Determine file pairs
+    if os.path.isdir(audio_path) and os.path.isdir(transcript_path):
+        audio_files = [f for f in os.listdir(audio_path)
+                       if f.lower().endswith('.wav')]
+        file_pairs = []
+        for wav in audio_files:
+            base = os.path.splitext(wav)[0]
+            wav_file = os.path.join(audio_path, wav)
+            csv_file = os.path.join(transcript_path, base + '.csv')
+            if os.path.exists(csv_file):
+                file_pairs.append((wav_file, csv_file))
+        if not file_pairs:
+            raise click.ClickException(
+                'No matching WAV/CSV pairs found in directories')
+    else:
+        file_pairs = [(audio_path, transcript_path)]
+
+    # Prepare summary CSV path
+    common_suffix = f"{accommodation_type}"
+    if accommodation_type == 'turn_level':
+        common_suffix += f"_{synchrony_mode}"
+    common_suffix += f"_w{win_frames}_h{hop_frames}_th{state_thresh}_loess{loess_frac}"
+    summary_csv = os.path.join(results_path, f"{common_suffix}_summary.csv")
+    summary_rows = []
+
+    # Process each file pair
+    for wav_path, csv_path in file_pairs:
+        audio_name = os.path.splitext(os.path.basename(wav_path))[0]
+        # Create output directories
+        call_dir = os.path.join(results_path, common_suffix)
+        img_dir = os.path.join(call_dir, 'images')
+        pkl_dir = os.path.join(call_dir, 'pickles')
+        os.makedirs(img_dir, exist_ok=True)
+        os.makedirs(pkl_dir, exist_ok=True)
+
+        # Instantiate analyzer
+        if accommodation_type == 'turn_level':
+            ac = TurnLevelProsodicAccomodation(
+                audio_path=wav_path,
+                transcript_csv=csv_path,
+                requested_features=feats,
+                verbose=verbose
+            )
+            ac.synchrony_mode = synchrony_mode
+            conv = ac.get_convergence()
+            sync = ac.get_synchrony()
+            if visualize:
+                plot_path = os.path.join(img_dir, f"{audio_name}_turn.png")
+                ac.get_visualization(
+                    output_path=plot_path,
+                    loess_frac=loess_frac,
+                    window=win_frames,
+                    hop=hop_frames,
+                    thresh=state_thresh
+                )
         else:
-            features_str = features
-
-        self.requested_features = [f.strip() for f in features_str.split(",") if f.strip()]
-
-    def prosodic_accommodation_pipeline(self) -> None:
-        """
-        Run the chosen prosodic accommodation pipeline, print convergence/synchrony,
-        and optionally visualize+save plots.
-        """
-        if self.accommodation_type == "turn_level":
-            print("=== Running Turn-Level Prosodic Accommodation ===\n")
-
-            # Instantiate with requested_features (or None to use default features)
-            TT = TurnLevelProsodicAccomodation(
-                audio_path=self.audio_path,
-                transcript_csv=self.transcript_csv,
-                requested_features=self.requested_features,
-                verbose=self.verbose,
+            PipelineClass = (
+                HYBRIDProsodicAcommodation if accommodation_type == 'hybrid'
+                else TAMAProsodicAcommodation
             )
-
-            # Compute accommodation details
-            #accom_dict = TT.get_accommodation()
-            conv = TT.get_convergence()    # dict: { feature: r_convergence }
-            sync = TT.get_synchrony()      # dict: { feature: r_synchrony }
-
-            #  Print convergence & synchrony
-            print("=== Convergence (per feature) ===")
-            for feat, r_val in conv.items():
-                print(f"  {feat}:   r_convergence = {r_val:.4f}")
-            print("\n=== Synchrony (per feature) ===")
-            for feat, r_val in sync.items():
-                print(f"  {feat}:   r_synchrony   = {r_val:.4f}")
-
-            # Optionally visualize (and save to results_path)
-            if self.visualize:
-                save_png = None
-                if self.results_path:
-                    os.makedirs(self.results_path, exist_ok=True)
-                    save_png = os.path.join(self.results_path, "turn_level_accommodation.png")
-                TT.get_visualization(output_path=save_png)
-
-        elif self.accommodation_type == "hybrid":
-            print("=== Running Hybrid Prosodic Accommodation ===\n")
-
-            HPA = HYBRIDProsodicAcommodation(
-                audio_path=self.audio_path,
-                transcript_csv=self.transcript_csv,
-                requested_features=self.requested_features,
-                window_len=20.0,
-                hop=10.0,
-                verbose=self.verbose,
+            ac = PipelineClass(
+                audio_path=wav_path,
+                transcript_csv=csv_path,
+                requested_features=feats,
+                verbose=verbose
             )
+            conv = ac.get_convergence()
+            sync = ac.get_synchrony_features()
+            if visualize:
+                plot_path = os.path.join(img_dir, f"{audio_name}_{accommodation_type}.png")
+                ac.get_visualization(
+                    output_path=plot_path,
+                    loess_frac=loess_frac,
+                    window=win_frames,
+                    hop=hop_frames,
+                    thresh=state_thresh
+                )
 
-            #accom_dict = HPA.get_accommodation()
-            conv = HPA.get_convergence() # dict: { feature: r_convergence }
-            sync_dict = HPA.get_synchrony(sync_window=5)  # dict: { feature: np.ndarray([...]) }
+        # Save metrics pickle
+        metrics_path = os.path.join(pkl_dir, f"{audio_name}_{accommodation_type}_metrics.pkl")
+        with open(metrics_path, 'wb') as f:
+            pickle.dump({'convergence': conv, 'synchrony': sync}, f)
 
-            print("=== Convergence (per feature) ===")
-            for feat, r_val in conv.items():
-                print(f"  {feat}:   r_convergence = {r_val:.4f}")
-            print("\n=== Synchrony (summary per feature) ===")
-            for feat, arr in sync_dict.items():
-                mean_r = float(arr.mean()) if arr.size > 0 else 0.0
-                print(f"  {feat}:   mean_r_synchrony = {mean_r:.4f}   (n={arr.size})")
+        # Build summary row
+        row = {
+            'audio_path': wav_path,
+            'transcript_path': csv_path,
+            'duration': getattr(ac, 'duration', None),
+            'features': '|'.join(feats) if feats else ''
+        }
+        # Add convergence
+        for feat, val in conv.items():
+            row[f'conv_{feat}'] = val
+        # Add synchrony metrics
+        for feat, arr in sync.items():
+            if isinstance(arr, dict) and 'r_values' in arr:
+                series = arr['r_values']
+                row[f'sync_{feat}_mean'] = np.mean(series)
+                row[f'sync_{feat}_n'] = len(series)
+            else:
+                row[f'sync_{feat}'] = arr
+        summary_rows.append(row)
 
-            if self.visualize:
-                save_png = None
-                if self.results_path:
-                    os.makedirs(self.results_path, exist_ok=True)
-                    save_png = os.path.join(self.results_path, "hybrid_accommodation.png")
-                HPA.get_visualization(output_path=save_png)
+        click.echo(f"Processed {audio_name}, results in {call_dir}")
 
-        elif self.accommodation_type == "tama":
-            print("=== Running TAMA Prosodic Accommodation ===\n")
+    # Write summary CSV
+    if summary_rows:
+        with open(summary_csv, 'w', newline='') as f:
+            writer = _csv.DictWriter(f, fieldnames=list(summary_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(summary_rows)
+        click.echo(f"Summary CSV written to {summary_csv}\n")
 
-            TPA = TAMAProsodicAcommodation(
-                audio_path=self.audio_path,
-                transcript_csv=self.transcript_csv,
-                requested_features=self.requested_features,
-                window_len=20.0,
-                hop=10.0,
-                verbose=self.verbose,
-            )
+@cli.command('list-features')
+def list_features():
+    """
+    List available prosodic features from the audio_features module.
+    """
+    dummy = AudioFeaturesOptimized(array=np.zeros(100), sr=16000)
+    try:
+        feats = dummy.get_feature_list()
+    except AttributeError:
+        feats = list(dummy.extract([]).keys())
+    click.echo("Available features:")
+    for f in feats:
+        click.echo(f" - {f}")
 
-            #accom_dict = TPA.get_accommodation()
-            conv = TPA.get_convergence() # dict: { feature: r_convergence }
-            sync_dict = TPA.get_synchrony(sync_window=5) # dict: { feature: np.ndarray([...]) }
-
-            print("=== Convergence (per feature) ===")
-            for feat, r_val in conv.items():
-                print(f"  {feat}:   r_convergence = {r_val:.4f}")
-            print("\n=== Synchrony (summary per feature) ===")
-            for feat, arr in sync_dict.items():
-                mean_r = float(arr.mean()) if arr.size > 0 else 0.0
-                print(f"  {feat}:   mean_r_synchrony = {mean_r:.4f}   (n={arr.size})")
-
-            if self.visualize:
-                save_png = None
-                if self.results_path:
-                    os.makedirs(self.results_path, exist_ok=True)
-                    save_png = os.path.join(self.results_path, "hybrid_accommodation.png")
-                TPA.get_visualization(output_path=save_png)
-
-        else:
-            raise ValueError(
-                f"Unknown accommodation_type: {self.accommodation_type}. "
-                f"Choose from ['turn_level','hybrid']."
-            )
-
-        print("\n=== Pipeline complete ===\n")
-        return
-
-
-if __name__ == "__main__":
-    fire.Fire(ProsodicAccommodation)
+if __name__ == '__main__':
+    cli()

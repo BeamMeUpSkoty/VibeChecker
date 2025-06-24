@@ -136,7 +136,7 @@ class TAMAProsodicAcommodation(BaseAccommodation):
                 rs.append(self._pearsonr(segA, segB))
             results[f] = np.array(rs)
         return results
-
+    '''
     def get_visualization(self, output_path: str = None):
         """
         Plot each requested feature’s trajectories and distances. Then print r_convergence and
@@ -180,6 +180,6 @@ class TAMAProsodicAcommodation(BaseAccommodation):
         for f in self.requested_features:
             mean_sync = float(sync[f].mean()) if sync[f].size > 0 else 0.0
             print(f"{f}: r_convergence = {conv[f]:.4f}, mean_r_synchrony = {mean_sync:.4f}")
-
+        '''
 
 

@@ -25,7 +25,7 @@ def turn_taking_files(tmp_path):
     wav_path = tmp_path / "dialog.wav"
     sf.write(str(wav_path), audio, sr)
 
-    csv_path = tmp_path / "transcript.csv"
+    csv_path = tmp_path / "audio.csv"
 
     entries = [
         {"start": 0.0, "end": 1.0, "text": "A1", "speaker": "A"},
