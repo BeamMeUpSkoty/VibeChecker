@@ -103,91 +103,56 @@ class TurnLevelProsodicAccomodation(BaseAccommodation):
             results[f] = corr
         return results
 
-    def get_synchrony(self) -> dict[str, float]:
-        """
+    def _turn_synchrony(self) -> dict[str, float]:
+        '''
         Turn-Taking synchrony: For each feature f:
           - Let A_prev = [A_0, A_1, …, A_{n-2}], B_curr = [B_1, …, B_{n-1}].
           - Return PearsonCorr(A_prev, B_curr). If n_exchanges ≤ 1, return 0.0.
-        """
+        '''
         accom = self.get_accommodation()
         results: Dict[str, float] = {}
-        for f, pairs in accom.items():
-            A_vals = pairs[:-1,0]
-            B_vals = pairs[1:,1]
-            if A_vals.size < 1 or np.std(A_vals)==0 or np.std(B_vals)==0:
-                corr = 0.0
+        for f in self.requested_features:
+            pairs = accom[f]
+            if pairs.shape[0] <= 1:
+                results[f] = 0.0
             else:
-                corr = float(np.corrcoef(A_vals, B_vals)[0,1])
-            results[f] = corr
+                results[f] = self._pearsonr(pairs[:-1,0], pairs[1:,1])
         return results
 
-    '''
-    def get_visualization(self, output_path: str = None, loess_frac: float = 0.3):
-        """
-        Plot each feature’s trajectories and distances across turn indices,
-        then overlay LOESS‐smoothed curves and print r_convergence and r_synchrony.
-        """
-        accom = self.get_accommodation()
-        conv = self.get_convergence()
-        sync = self.get_synchrony()
+    def _dynamic_synchrony(self, window, hop):
+        accom = self.get_accommodation()  # dict: feat → Nx2 array
+        results = {}
+        for feat, pair_arr in accom.items():
+            rs = []
+            for idx, i in enumerate(range(0, len(pair_arr) - window + 1, hop)):
+                a_win = pair_arr[i:i + window, 0]
+                b_win = pair_arr[i:i + window, 1]
+                r = self._pearsonr(a_win, b_win)
+                if idx < 3:  # only print first 3 windows
+                    print(f"[DEBUG][{feat}] window {idx}: r = {r:.4f}")
+                rs.append(r)
+            results[feat] = np.array(rs)
+        return results
 
-        n_exchanges = accom[self.requested_features[0]].shape[0]
-        t = np.arange(n_exchanges)
-        nf = len(self.requested_features)
-
-        fig, axes = plt.subplots(nf, 2, figsize=(10, 4 * nf))
-        if nf == 1:
-            axes = np.array([[axes[0], axes[1]]])  # ensure 2D
-
-        for row, f in enumerate(self.requested_features):
-            A_vals = accom[f][:, 0]
-            B_vals = accom[f][:, 1]
-            dist = np.abs(A_vals - B_vals)
-
-            # —— Trajectories subplot —— #
-            ax1 = axes[row, 0]
-            ax1.plot(t, A_vals, "-o", label=f"{self.speaker_A}_{f}", alpha=0.6)
-            ax1.plot(t, B_vals, "-s", label=f"{self.speaker_B}_{f}", alpha=0.6)
-
-            # compute & plot LOESS for A and B
-            lo_A = lowess(endog=A_vals, exog=t, frac=loess_frac, return_sorted=True)
-            lo_B = lowess(endog=B_vals, exog=t, frac=loess_frac, return_sorted=True)
-            ax1.plot(lo_A[:, 0], lo_A[:, 1],
-                     linestyle="--", linewidth=2,
-                     label=f"{self.speaker_A}_{f} (LOESS)")
-            ax1.plot(lo_B[:, 0], lo_B[:, 1],
-                     linestyle="--", linewidth=2,
-                     label=f"{self.speaker_B}_{f} (LOESS)")
-
-            ax1.set_title(f"{f} trajectories (Turn‐Taking)")
-            ax1.set_xlabel("Turn Index")
-            ax1.set_ylabel(f)
-            ax1.legend()
-
-            # —— Distance subplot —— #
-            ax2 = axes[row, 1]
-            ax2.plot(t, dist, "-x", color="gray", label="|A−B|", alpha=0.6)
-
-            # compute & plot LOESS for distance
-            lo_D = lowess(endog=dist, exog=t, frac=loess_frac, return_sorted=True)
-            ax2.plot(lo_D[:, 0], lo_D[:, 1],
-                     linestyle="--", linewidth=2,
-                     label="|A−B| (LOESS)")
-
-            ax2.set_title(f"{f} |A−B| per turn")
-            ax2.set_xlabel("Turn Index")
-            ax2.set_ylabel("Distance")
-            ax2.legend()
-
-        plt.tight_layout()
-        if output_path:
-            fig.savefig(output_path)
+    def get_synchrony(self) -> dict:
+        mode = getattr(self, "synchrony_mode", "turn")
+        if mode == "turn":
+            print(f"[DEBUG][turn] using _turn_synchrony()")
+            return self._turn_synchrony()
+        elif mode == "dynamic":
+            print(f"[DEBUG][dynamic] window={self.win_frames}, hop={self.hop_frames}")
+            raw = self._dynamic_synchrony(self.win_frames, self.hop_frames)
+            return {feat: {"r_values": raw[feat]}
+                    for feat in self.requested_features}
+        elif mode == "combined":
+            print(f"[DEBUG][combined] combining static+dynamic")
+            static = self._turn_synchrony()
+            print(f"[DEBUG][static] mean_f0 r = {static['mean_f0']:.4f}")
+            dyn = self._dynamic_synchrony(self.win_frames, self.hop_frames)
+            combined = {
+                f: (static[f] + float(np.mean(dyn[f]))) / 2
+                for f in self.requested_features
+            }
+            return combined
         else:
-            plt.show()
-
-        print("\n=== Turn-Taking Accommodation Summary ===")
-        for f in self.requested_features:
-            r_conv = conv[f]
-            r_sync = sync[f]
-            print(f"{f}:   r_convergence = {r_conv:.4f},   r_synchrony = {r_sync:.4f}")
-        '''
+            raise ValueError(f"Unknown synchrony_mode {mode!r}")

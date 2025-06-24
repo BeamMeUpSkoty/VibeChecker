@@ -2,11 +2,11 @@ from abc import ABC, abstractmethod
 import csv
 import numpy as np
 import soundfile as sf
-from typing import List, Dict
 from scipy.stats import pearsonr
-import matplotlib.pyplot as plt
 from statsmodels.nonparametric.smoothers_lowess import lowess
-
+from typing import Dict, List, Tuple, Optional
+import matplotlib.pyplot as plt
+from matplotlib.axes import Axes
 from audio_features.audio_features import AudioFeaturesOptimized
 
 class BaseAccommodation(ABC):
@@ -260,10 +260,10 @@ class BaseAccommodation(ABC):
         accom = self.get_accommodation()
         out = {}
         for f in self.requested_features:
-            A, B      = accom[f][:,0], accom[f][:,1]
+            A, B = accom[f][:,0], accom[f][:,1]
             rs, times = self.dynamic_synchrony(A, B)
-            stats     = self.phase_metrics(rs)
-            out[f]    = {**stats, 'r_values': rs, 'r_times': times}
+            stats = self.phase_metrics(rs)
+            out[f] = {**stats, 'r_values': rs, 'r_times': times}
         return out
 
     def get_state_features(self,
@@ -311,7 +311,7 @@ class BaseAccommodation(ABC):
         for start in range(0, n - window + 1, hop):
             segA = A_vals[start:start+window]
             segB = B_vals[start:start+window]
-            segD =    d[start:start+window]
+            segD = d[start:start+window]
             # synchrony / asynchrony
             r_sync, _ = pearsonr(segA, segB)
             is_sync  = r_sync >=  thresh
@@ -342,106 +342,271 @@ class BaseAccommodation(ABC):
             states.append(state)
         return np.array(states)
 
-    def get_visualization(
-            self,
-            output_path: str = None,
-            loess_frac: float = None,
-            window: int = 10,
-            hop: int = 5,
-            thresh: float = 0.5,
-    ):
-        """
-        Default 4-column visualization for each requested feature:
-          1) A vs. B trajectories per time-step
-          2) |A−B| distance per time-step
-          3) dynamic synchrony r(t) with red/green shaded spans
-          4) seven “states of accommodation” (maintenance, synchrony, convergence,
-             synchrony+convergence, asynchrony, divergence, asynchrony+divergence)
-        """
-        # 1. get data
-        accom = self.get_accommodation()
-        sync_feats = self.get_synchrony_features()
-        state_feats = self.get_state_features(window, hop, thresh)
+    def _plot_trajectories(
+        self,
+        ax: Axes,
+        feature: str,
+        accom: Dict[str, np.ndarray],
+        t_index: np.ndarray,
+        loess_frac: Optional[float]
+    ) -> None:
+        A = accom[feature][:, 0]
+        B = accom[feature][:, 1]
+        ax.plot(t_index, A, '-o', alpha=0.6, label=f"{self.speaker_A}")
+        ax.plot(t_index, B, '-s', alpha=0.6, label=f"{self.speaker_B}")
+        ax.set(title=f"{feature} trajectories", xlabel="Turn #", ylabel=feature)
+        if loess_frac is not None:
+            lo_A = lowess(endog=A, exog=t_index, frac=loess_frac, return_sorted=True)
+            lo_B = lowess(endog=B, exog=t_index, frac=loess_frac, return_sorted=True)
+            ax.plot(lo_A[:, 0], lo_A[:, 1], '--', label=f"{self.speaker_A} LOESS")
+            ax.plot(lo_B[:, 0], lo_B[:, 1], '--', label=f"{self.speaker_B} LOESS")
+        ax.legend()
 
-        # 2. layout
+    def _plot_distance(
+        self,
+        ax: Axes,
+        feature: str,
+        accom: Dict[str, np.ndarray],
+        t_index: np.ndarray
+    ) -> None:
+        dist = np.abs(accom[feature][:, 0] - accom[feature][:, 1])
+        ax.plot(t_index, dist, '-x', color='gray', alpha=0.6)
+        ax.set(title=f"{feature} |A–B|", xlabel="Turn #", ylabel="Distance")
+
+    def _plot_synchrony(
+        self,
+        ax: Axes,
+        feature: str,
+        sync_feats: Dict[str, Dict[str, np.ndarray]],
+        mode: str,
+        window: int,
+        thresh: float,
+        frame_duration: float
+    ) -> None:
+        info = sync_feats[feature]
+        times = info["r_times"]
+        rs = info["r_values"]
+
+        if mode == "combined":
+            ax.plot(times, rs, '-o', label="dynamic r")
+            static_r = info["_static"]
+            ax.axhline(static_r, color='red', linestyle='--', label="turn r")
+        else:
+            ax.plot(times, rs, '-o', label=f"{mode} r")
+
+        half_span = (window * frame_duration) / 2
+        pos_intervals = [(t - half_span, t + half_span) for r, t in zip(rs, times) if r >= thresh]
+        neg_intervals = [(t - half_span, t + half_span) for r, t in zip(rs, times) if r <= -thresh]
+
+        def _merge(intervals: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+            merged: List[Tuple[float, float]] = []
+            for start, end in sorted(intervals):
+                if not merged or start > merged[-1][1]:
+                    merged.append((start, end))
+                else:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            return merged
+
+        for start, end in _merge(pos_intervals):
+            ax.axvspan(start, end, color='red', alpha=0.3)
+        for start, end in _merge(neg_intervals):
+            ax.axvspan(start, end, color='green', alpha=0.3)
+
+        ax.axhline(thresh, linestyle='--', color='red')
+        ax.axhline(-thresh, linestyle='--', color='green')
+        ax.set(
+            title=f"{feature} synchrony ({mode})",
+            xlabel="Time (s)",
+            ylabel="r"
+        )
+        ax.legend(loc='upper right')
+
+    def _plot_transition_matrix(
+        self,
+        ax: Axes,
+        feature: str,
+        state_feats: Dict[str, np.ndarray]
+    ) -> None:
+        states = state_feats[feature]
+        max_state = states.max()
+        counts = np.zeros((max_state, max_state), dtype=int)
+        for prev, nxt in zip(states[:-1], states[1:]):
+            counts[prev - 1, nxt - 1] += 1
+        row_sums = counts.sum(axis=1, keepdims=True)
+        probs = counts / np.where(row_sums == 0, 1, row_sums)
+
+        im = ax.imshow(probs, cmap='Blues', vmin=0, vmax=1)
+        ax.set_title(f"{feature} state transitions")
+        ax.set_xlabel("Next state")
+        ax.set_ylabel("Previous state")
+        ax.set_xticks(range(max_state))
+        ax.set_yticks(range(max_state))
+
+        for i in range(max_state):
+            for j in range(max_state):
+                color = "white" if probs[i, j] > 0.5 else "black"
+                ax.text(j, i, str(counts[i, j]), ha="center", va="center", color=color)
+
+        plt.colorbar(im, ax=ax, label="P(next|prev)")
+
+    def _plot_raster(
+        self,
+        ax: Axes,
+        state_series: Dict[str, np.ndarray],
+        window: int,
+        frame_duration: float
+    ) -> None:
+        """
+        state_series: mapping from label to its state-array.
+        """
+        for row, (label, states) in enumerate(state_series.items()):
+            times = (np.arange(len(states)) + window / 2) * frame_duration
+            ax.scatter(times, [row] * len(states), c=states, cmap='tab10', s=10)
+        ax.set_yticks(range(len(state_series)))
+        ax.set_yticklabels(list(state_series.keys()))
+        ax.set_xlabel("Time (s)")
+        ax.set_title("State raster across sequences")
+
+    def _plot_gantt(
+            self,
+            ax: Axes,
+            feature: str,
+            state_feats: Dict[str, np.ndarray],
+            window: int,
+            hop: int,
+            frame_duration: float
+    ) -> None:
+        """
+        On ax, draw a Gantt‐style timeline for `feature`’s state sequence.
+        Each state i is represented as a block of duration hop*frame_duration,
+        starting at time i*hop*frame_duration; contiguous runs of the same
+        state get merged into a single longer block.
+        """
+        states = state_feats[feature]  # 1D array of state IDs
+        n = len(states)
+        # compute non-overlapping start times and durations
+        starts = np.arange(n) * hop * frame_duration
+        lengths = np.full(n, hop * frame_duration)
+        # merge contiguous runs
+        segments = []
+        cur_state = states[0]
+        cur_start = starts[0]
+        cur_len = lengths[0]
+        for s, dur, st in zip(starts[1:], lengths[1:], states[1:]):
+            if st == cur_state:
+                cur_len += dur
+            else:
+                segments.append((cur_start, cur_len, cur_state))
+                cur_state, cur_start, cur_len = st, s, dur
+        segments.append((cur_start, cur_len, cur_state))
+
+        # pick colors from tab10 (state IDs start at 1)
+        cmap = plt.get_cmap('tab10')
+        for start, dur, st in segments:
+            ax.broken_barh(
+                [(start, dur)],
+                (0, 1),
+                facecolors=cmap((st - 1) % 10),
+                edgecolor='black',
+                alpha=0.8
+            )
+
+        ax.set_ylim(0, 1)
+        ax.set_yticks([])
+        ax.set_xlabel("Time (s)")
+        ax.set_title(f"{feature} state timeline (Gantt)")
+        # build a custom legend
+        unique_states = sorted(set(states))
+        handles = [
+            plt.Line2D([0], [0], color=cmap((st - 1) % 10), lw=8, label=f"State {st}")
+            for st in unique_states
+        ]
+        ax.legend(handles=handles, bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
+
+    def _shade_states_background(
+        self,
+        ax: Axes,
+        feature: str,
+        state_feats: Dict[str, np.ndarray],
+        window: int,
+        frame_duration: float,
+        alpha: float = 0.15
+    ) -> None:
+        """
+        Shades the background of `ax` in bands according to the state sequence
+        for `feature`. Each band spans one state-window (window*frame_duration).
+        """
+        states = state_feats[feature]            # e.g. array([1,2,2,3,...])
+        n = len(states)
+        # compute center times of each state-window
+        centers = (np.arange(n) + window/2) * frame_duration
+        half = (window * frame_duration) / 2
+
+        cmap = plt.get_cmap("tab10")
+        for st, ct in zip(states, centers):
+            start, end = ct - half, ct + half
+            ax.axvspan(start, end,
+                       facecolor=cmap((st-1) % 10),
+                       alpha=alpha,
+                       edgecolor="none")
+
+    def get_visualization(
+        self,
+        output_path: Optional[str] = None,
+        loess_frac: Optional[float] = None,
+        window: int = 10,
+        hop: int = 5,
+        thresh: float = 0.5
+    ) -> None:
+        accom = self.get_accommodation()
         n_steps = next(iter(accom.values())).shape[0]
         t_index = np.arange(n_steps)
-        nf = len(self.requested_features)
+        full_times = t_index * self.frame_duration
+        mode = getattr(self, "synchrony_mode", "dynamic")
 
+        dynamic_feats = self.get_synchrony_features()
+        state_feats = self.get_state_features(window, hop, thresh)
+
+        # build sync_feats (turn / combined / dynamic)
+        if mode == "turn":
+            static = self.get_synchrony()
+            sync_feats = {
+                f: {
+                    "r_values": np.full_like(full_times, static[f], dtype=float),
+                    "r_times": full_times
+                }
+                for f in self.requested_features
+            }
+        elif mode == "combined":
+            static = self.get_synchrony()
+            sync_feats = {}
+            for f in self.requested_features:
+                sync_feats[f] = {
+                    "r_values": dynamic_feats[f]["r_values"],
+                    "r_times": dynamic_feats[f]["r_times"],
+                    "_static": static[f]
+                }
+        else:
+            sync_feats = dynamic_feats
+
+        nf = len(self.requested_features)
         fig, axes = plt.subplots(nf, 4, figsize=(20, 4 * nf))
         if nf == 1:
             axes = np.array([axes])
 
-        # 3. loop over features
         for row, f in enumerate(self.requested_features):
-            A = accom[f][:, 0]
-            B = accom[f][:, 1]
-            dist = np.abs(A - B)
-
-            # dynamic synchrony
-            rs, times = sync_feats[f]['r_values'], sync_feats[f]['r_times']
-
-            # accommodation states (1–7)
-            states = state_feats[f]
-
-            # — col 0: trajectories —
-            ax0 = axes[row, 0]
-            ax0.plot(t_index, A, '-o', alpha=0.6, label=f"{self.speaker_A}_{f}")
-            ax0.plot(t_index, B, '-s', alpha=0.6, label=f"{self.speaker_B}_{f}")
-            ax0.set(title=f"{f} trajectories", xlabel="Time-step", ylabel=f)
-            ax0.legend()
-
-            if loess_frac is not None:
-                lo_A = lowess(endog=A, exog=t_index, frac=loess_frac, return_sorted=True)
-                lo_B = lowess(endog=B, exog=t_index, frac=loess_frac, return_sorted=True)
-                ax0.plot(lo_A[:, 0], lo_A[:, 1],
-                         linestyle='--', linewidth=2, label=f"{self.speaker_A} (LOESS)")
-                ax0.plot(lo_B[:, 0], lo_B[:, 1],
-                         linestyle='--', linewidth=2, label=f"{self.speaker_B} (LOESS)")
-                ax0.legend()
-
-            # — col 1: distance —
-            ax1 = axes[row, 1]
-            ax1.plot(t_index, dist, '-x', color='gray', alpha=0.6)
-            ax1.set(title=f"{f} |A−B|", xlabel="Time-step", ylabel="Distance")
-
-            # — col 2: dynamic synchrony —
-            ax2 = axes[row, 2]
-            ax2.plot(times, rs, '-o', label='r (Pearson)')
-            half_win = (window * self.frame_duration) / 2
-            for r_val, mid in zip(rs, times):
-                start, end = mid - half_win, mid + half_win
-                if r_val >= thresh:
-                    ax2.axvspan(start, end, color='red', alpha=0.3)
-                elif r_val <= -thresh:
-                    ax2.axvspan(start, end, color='green', alpha=0.3)
-            ax2.axhline(thresh, linestyle='--', color='red')
-            ax2.axhline(-thresh, linestyle='--', color='green')
-            ax2.set(title=f"{f} dynamic synchrony", xlabel="Time (s)", ylabel="r")
-            ax2.legend(loc='upper right')
-
-            # — col 3: accommodation states —
-            ax3 = axes[row, 3]
-            # scatter state IDs over time for simplicity
-            # map state IDs to integers 1–7 on the y-axis
-            state_times = (np.arange(len(states)) + window / 2) * self.frame_duration
-            ax3.scatter(state_times, states, c=states, cmap='tab10', s=50)
-            ax3.set(
-                title=f"{f} accommodation states",
-                xlabel="Time (s)",
-                ylabel="State ID",
-                yticks=[1, 2, 3, 4, 5, 6, 7],
-            )
-            # optionally annotate the legend manually:
-            ax3.legend([
-                "1: maintenance",
-                "2: synchrony",
-                "3: convergence",
-                "4: sync+conv",
-                "5: asynchrony",
-                "6: divergence",
-                "7: async+div"
-            ], loc='upper right', fontsize='small')
+            ax0, ax1, ax2, ax3 = axes[row]
+            self._plot_trajectories(ax0, f, accom, t_index, loess_frac)
+            self._plot_distance(ax1, f, accom, t_index)
+            self._plot_synchrony(ax2, f, sync_feats, mode, window, thresh, self.frame_duration)
+            # Choose either transition matrix or raster here:
+            #self._plot_transition_matrix(ax3, f, state_feats)
+            self._plot_raster(ax3, state_feats, window, self.frame_duration)
+            #self._plot_gantt(ax3, f, state_feats, window, hop, self.frame_duration)
+            # after plotting A and B on ax0
+            #self._shade_states_background(
+            #    ax0, f, state_feats, window, self.frame_duration, alpha=0.1
+            #)
 
         plt.tight_layout()
         if output_path:

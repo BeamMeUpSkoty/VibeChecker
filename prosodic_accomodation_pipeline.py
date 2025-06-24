@@ -117,8 +117,16 @@ def run(
                 verbose=verbose
             )
             ac.synchrony_mode = synchrony_mode
+            ac.win_frames = win_frames
+            ac.hop_frames = hop_frames
+            ac.state_thresh = state_thresh
+
             conv = ac.get_convergence()
             sync = ac.get_synchrony()
+            static = ac._turn_synchrony()
+            dynamic = ac._dynamic_synchrony(ac.win_frames, ac.hop_frames)
+            print(f"[DEBUG] static mean_f0 r = {static['mean_f0']:.4f}")
+            print(f"[DEBUG] dynamic mean_f0 mean(r) = {dynamic['mean_f0'].mean():.4f}")
             if visualize:
                 plot_path = os.path.join(img_dir, f"{audio_name}_turn.png")
                 ac.get_visualization(
@@ -141,6 +149,7 @@ def run(
             )
             conv = ac.get_convergence()
             sync = ac.get_synchrony_features()
+
             if visualize:
                 plot_path = os.path.join(img_dir, f"{audio_name}_{accommodation_type}.png")
                 ac.get_visualization(
@@ -167,15 +176,24 @@ def run(
         for feat, val in conv.items():
             row[f'conv_{feat}'] = val
         # Add synchrony metrics
+        # updated code: also catch plain numpy arrays
         for feat, arr in sync.items():
+            # if it's the old dict form, pull out 'r_values'
             if isinstance(arr, dict) and 'r_values' in arr:
                 series = arr['r_values']
-                row[f'sync_{feat}_mean'] = np.mean(series)
-                row[f'sync_{feat}_n'] = len(series)
+            # if it's a raw numpy array (your dynamic mode), treat it the same
+            elif isinstance(arr, np.ndarray):
+                series = arr
             else:
-                row[f'sync_{feat}'] = arr
-        summary_rows.append(row)
+                series = None
 
+            if series is not None:
+                row[f'sync_{feat}'] = np.mean(series)
+            else:
+                # e.g. static/combined already returned a float
+                row[f'sync_{feat}'] = arr
+
+        summary_rows.append(row)
         click.echo(f"Processed {audio_name}, results in {call_dir}")
 
     # Write summary CSV
