@@ -1,4 +1,3 @@
-from audio_features.audio_features import AudioFeatures
 from accomodation_types.base_accomodation import BaseAccommodation
 import numpy as np
 import matplotlib.pyplot as plt

@@ -7,7 +7,7 @@ from scipy.stats import pearsonr
 import matplotlib.pyplot as plt
 from statsmodels.nonparametric.smoothers_lowess import lowess
 
-from audio_features.audio_features_optimized import AudioFeaturesOptimized
+from audio_features.audio_features import AudioFeaturesOptimized
 
 class BaseAccommodation(ABC):
     """

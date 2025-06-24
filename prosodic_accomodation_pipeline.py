@@ -5,7 +5,7 @@ import pickle
 import click
 import csv as _csv
 import numpy as np
-from audio_features.audio_features_optimized import AudioFeaturesOptimized
+from audio_features.audio_features import AudioFeaturesOptimized
 
 from accomodation_types.turn_level_prosodic_acommodation import TurnLevelProsodicAccomodation
 from accomodation_types.hybrid_prosodic_acomodation import HYBRIDProsodicAcommodation

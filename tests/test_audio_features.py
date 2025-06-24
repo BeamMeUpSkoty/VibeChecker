@@ -1,7 +1,5 @@
 import os
 import pytest
-from audio_features.audio_features import AudioFeatures
-
 
 current_directory = os.path.dirname(__file__)
 TEST_WAV = os.path.join(current_directory, "data", "example.wav")
