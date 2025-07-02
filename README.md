@@ -67,7 +67,7 @@ All methods use Pearson *r* as their core metric. Dynamic, TAMA, and HYBRID retu
 * **TAMA**: Uniform, transcript-independent analysis; ideal when turn boundaries are unreliable.
 * **HYBRID**: Utterance-grounded dynamic analysis; use when prosody at the utterance scale matters.
 
-Configure specifics—window size, hop length, thresholds—via the `AccomConfig` class.—window size, hop length, thresholds—via the `AccomConfig` class.
+Configure specifics—window size, hop length, thresholds—via the `AccomConfig` class.
 
 ---
 
