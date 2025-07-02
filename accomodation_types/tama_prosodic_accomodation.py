@@ -135,50 +135,5 @@ class TAMAProsodicAcommodation(BaseAccommodation):
                 rs.append(self._pearsonr(segA, segB))
             results[f] = np.array(rs)
         return results
-    '''
-    def get_visualization(self, output_path: str = None):
-        """
-        Plot each requested feature’s trajectories and distances. Then print r_convergence and
-        mean(r_synchrony). If output_path is given, save the figure there.
-        """
-
-        accom = self.get_accommodation()
-        conv = self.get_convergence()
-        sync = self.get_synchrony()
-        nwin = accom[self.requested_features[0]].shape[0]
-        t = self.window_starts
-        nf = len(self.requested_features)
-
-        fig, axes = plt.subplots(nf, 2, figsize=(10, 4 * nf))
-        if nf == 1:
-            axes = np.array([[axes[0], axes[1]]])  # ensure 2D indexing
-
-        for row, f in enumerate(self.requested_features):
-            A_vals = accom[f][:, 0]
-            B_vals = accom[f][:, 1]
-            dist = np.abs(A_vals - B_vals)
-
-            ax1 = axes[row, 0]
-            ax1.plot(t, A_vals, "-o", label=f"A_{f}")
-            ax1.plot(t, B_vals, "-s", label=f"B_{f}")
-            ax1.set_title(f"{f} trajectories (TAMA)")
-            ax1.legend()
-
-            ax2 = axes[row, 1]
-            ax2.plot(t, dist, "-x", color="gray", label="|A−B|")
-            ax2.set_title(f"{f} distance per window")
-            ax2.legend()
-
-        plt.tight_layout()
-        if output_path:
-            fig.savefig(output_path)
-        else:
-            plt.show()
-
-        print("\n=== TAMA Accommodation Summary ===")
-        for f in self.requested_features:
-            mean_sync = float(sync[f].mean()) if sync[f].size > 0 else 0.0
-            print(f"{f}: r_convergence = {conv[f]:.4f}, mean_r_synchrony = {mean_sync:.4f}")
-        '''
 
 

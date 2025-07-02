@@ -4,9 +4,8 @@ import librosa
 import argparse
 from typing import Dict, List, Optional, Tuple
 
-class AudioFeaturesOptimized:
+class AudioFeatures:
     """
-    High-performance audio feature extractor:
       - Loads audio once and caches raw waveform
       - Pre-computes Pitch and Intensity for full audio
       - Acoustic-based articulation rate (no transcript needed)

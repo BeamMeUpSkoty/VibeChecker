@@ -7,7 +7,7 @@ from statsmodels.nonparametric.smoothers_lowess import lowess
 from typing import Dict, List, Tuple, Optional
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
-from audio_features.audio_features import AudioFeaturesOptimized
+from audio_features.audio_features import AudioFeatures
 
 class BaseAccommodation(ABC):
     """
@@ -210,7 +210,7 @@ class BaseAccommodation(ABC):
             # if empty chunk, return 0.0 for all requested_features
             return {f: 0.0 for f in self.requested_features}
 
-        af = AudioFeaturesOptimized(array=array_chunk, sr=self.sr)
+        af = AudioFeatures(array=array_chunk, sr=self.sr)
         return af.extract(self.requested_features, verbose=self.verbose)
 
     def dynamic_synchrony(self, A_vals: np.ndarray, B_vals: np.ndarray, window: int = 10, hop: int = 5):
@@ -590,18 +590,18 @@ class BaseAccommodation(ABC):
             sync_feats = dynamic_feats
 
         nf = len(self.requested_features)
-        fig, axes = plt.subplots(nf, 4, figsize=(20, 4 * nf))
+        fig, axes = plt.subplots(nf, 3, figsize=(20, 3 * nf))
         if nf == 1:
             axes = np.array([axes])
 
         for row, f in enumerate(self.requested_features):
-            ax0, ax1, ax2, ax3 = axes[row]
+            ax0, ax1, ax2 = axes[row]
             self._plot_trajectories(ax0, f, accom, t_index, loess_frac)
             self._plot_distance(ax1, f, accom, t_index)
             self._plot_synchrony(ax2, f, sync_feats, mode, window, thresh, self.frame_duration)
             # Choose either transition matrix or raster here:
             #self._plot_transition_matrix(ax3, f, state_feats)
-            self._plot_raster(ax3, state_feats, window, self.frame_duration)
+            #self._plot_raster(ax3, state_feats, window, self.frame_duration)
             #self._plot_gantt(ax3, f, state_feats, window, hop, self.frame_duration)
             # after plotting A and B on ax0
             #self._shade_states_background(

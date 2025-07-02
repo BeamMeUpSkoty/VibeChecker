@@ -1,79 +1,274 @@
 # VibeChecker
 
-This Python package calculates prosodic accommodation between two speakers in a conversation. It extracts and compares speech features turn-by-turn or via summary measures.
+VibeChecker is a Python library for measuring prosodic accommodation between two speakers in a conversation. It extracts low‑level audio features, applies configurable accommodation strategies, and produces both turn‑level and sliding‑window summary metrics.
 
-accomodation_types/turn_level_prosodic_acommodation.py: Implements turn‐exchange‐based accommodation (following Šturm et al. 2021).
-accomodation_types/tama_prosodic_accomodation.py: Implements the fixed‐window (“time‐aligned moving average” / TAMA) approach from De Looze et al. (2014).
-accomodation_types/hybrid_prosodic_acomodation.py: Implements utterance‐sensitive TAMA (the “Hybrid” described in De Looze & Rauzy (2011)).
+---
 
-### Accomodation Types
+## Table of Contents
 
+1. [Accomodation Types & Strategies](#accomodation-types--strategies)
+2. [Generated Metrics & States](#generated-metrics--states)
+3. [Audio Features](#audio-features)
+4. [Pipeline & CLI Options](#pipeline--cli-options)
+5. [Installation](#installation)
+6. [File Structure](#file-structure)
+7. [Usage](#usage)
+8. [Programmatic API](#programmatic-api)
+9. [License](#license)
+
+---
+
+## What Is Prosodic Accommodation?
+
+Prosodic accommodation refers to the tendency of conversational partners to align their speech patterns—pitch, intensity, rate—over time. VibeChecker quantifies this alignment through multiple strategies and derives interpretable metrics.
+
+---
+
+## Pipeline Overview
+
+VibeChecker orchestrates the following steps to analyze prosodic accommodation between two speakers:
+
+1. **Input**: Two-channel WAV or two single-channel WAVs plus a CSV transcript with time-aligned turns.
+2. **Feature Extraction**: Use `AudioFeatures` to extract low-level prosodic features (pitch, intensity, rate) for each speaker over frames or turns.
+3. **Accommodation Computation**: Apply selected strategy (turn-level, TAMA, or hybrid) to pair or window feature series and compute synchrony and convergence time-series.
+4. **State Classification**: Label each turn or frame as synchronized, asynchronized, converging, or diverging based on thresholds.
+5. **High-Level Metrics**: Aggregate time-series into summary metrics—mean/SD of synchrony, convergence slopes, state durations, and concurrent state proportions.
+6. **Outputs**:
+
+   * **CSV Report**: Summary of metrics and state proportions.
+   * **Pickled Data**: Raw time-series for further analysis.
+   * **PDF/PNG Visualizations**: LOESS-smoothed plots of feature trajectories and state timelines.
+
+---
+
+## Accomodation Types & Strategies
+
+| Module                                                   | Strategy            | Description                                                                                                                             |       |       |
+| -------------------------------------------------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ----- | ----- |
+| `accomodation_types/turn_level_prosodic_acommodation.py` | Turn‑level          | Pair successive turns: synchrony = PearsonCorr(Aᵢ₋₁, Bᵢ); convergence = PearsonCorr(                                                    | Aᵢ−Bᵢ | , i). |
+| `accomodation_types/tama_prosodic_accomodation.py`       | Fixed-window (TAMA) | Sliding-window on fixed-length frames: average features per-speaker window, then Corr.                                                  |       |       |
+| `accomodation_types/hybrid_prosodic_acomodation.py`      | Hybrid              | Utterance-sensitive TAMA: extend fixed windows to nearest utterance boundaries per speaker.                                             |       |       |
+| `accom_features/feature_strategy.py`                     | Strategies & States | Implements `TurnSynchrony`, `DynamicSynchrony`, `CombinedSynchrony`, `ConvergenceStrategy`, `StateStrategy`, `ConcurrentStrategy`, etc. |       |       |
+
+Configure specifics—window size, hop length, thresholds—via the `AccomConfig` class.
+
+---
+
+## State Classification
+
+VibeChecker labels each frame or turn based on synchrony and convergence metrics relative to configurable thresholds:
+
+* **Synchronized**: synchrony score ≥ threshold and |A−B| distance decreasing or stable.
+* **Asynchronized**: synchrony score < threshold and |A−B| distance stable.
+* **Converging**: slope of |A−B| over time < −threshold (features moving closer).
+* **Diverging**: slope of |A−B| over time > threshold (features moving apart).
+
+Thresholds (e.g., synchrony and convergence) are set in `AccomConfig` (`state_thresh`). You can also adjust LOESS smoothing for robust state detection.
+
+---
+
+### Feature Strategy Classes
+
+| Class Name            | Purpose                                                                                 | Calculation                                                                                           |             |                         |
+| --------------------- | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ----------- | ----------------------- |
+| `TurnSynchrony`       | Turn-level synchrony: correlation of successive turns.                                  | PearsonCorr(Aᵢ₋₁, Bᵢ) over all valid i ≥ 1.                                                           |             |                         |
+| `DynamicSynchrony`    | Dynamic synchrony: sliding-window correlation over feature trajectories.                | Sliding-window PearsonCorr over paired feature series within each window defined by `window` & `hop`. |             |                         |
+| `CombinedSynchrony`   | Unified synchrony metric combining turn-level and dynamic.                              | Aggregate (e.g., mean) of turn-level and dynamic synchrony scores for each segment or session.        |             |                         |
+| `ConvergenceStrategy` | Convergence: directional alignment of feature values over time.                         | Slope of linear regression of                                                                         | A\_t − B\_t | against time indices t. |
+| `StateStrategy`       | Frame/turn-level state classification into synchrony/asynchrony/convergence/divergence. | Compare synchrony and convergence values to threshold: assign state based on >/- threshold criteria.  |             |                         |
+| `ConcurrentStrategy`  | Concurrent states: joint consistency across all features.                               | Fraction of windows where every feature’s state label matches across speakers within that window.     |             |                         |
+
+Configure specifics—window size, hop length, thresholds—via the `AccomConfig` class.—window size, hop length, thresholds—via the `AccomConfig` class.
+
+---
+
+## Generated Metrics & States
+
+VibeChecker computes:
+
+* **Synchrony**
+
+  * *Turn-level*: Pearson correlation between adjacent turns.
+  * *Dynamic (TAMA)*: Sliding-window correlation over feature time-series.
+  * *Combined*: Aggregate of both.
+* **Convergence/Divergence**
+
+  * Slope of inter-speaker distance changes (|A−B| over time).
+* **State Classification**
+
+  * Labels each frame/turn as synchronized, asynchronized, converging, or diverging.
+* **State Durations**
+
+  * Total and mean durations for each state.
+* **Concurrent States**
+
+  * Fraction of windows where *all* features share the same state.
+
+**Outputs**
+
+* **CSV Reports**: Mean, SD, and proportions of metrics and states.
+* **Pickle Files**: Raw time-series data under `results/.../pickles/`.
+* **Visualizations**: LOESS-smoothed plots of feature trajectories, synchrony phases, and state timelines.
+
+---
+
+## Audio Features
+
+Extracted by `AudioFeatures` in `audio_features/audio_features.py`:
+
+* **Pitch (F0)**: min, max, mean, median, SD, range, 80th-percentile.
+* **Intensity**: mean & SD of amplitude contour.
+* **Articulation Rate**: syllable nuclei per second (De Jong & Wempe, 2009).
+* **Sampling**: Optional resampling (default 16 kHz).
+* **Caching**: Segment-level FFTs and stats are cached for efficiency.
+
+Use `extract_all()` to retrieve all features or `extract(keys=[...])` for a subset.
+
+---
+
+## Pipeline & CLI Options
+
+The `prosodic_accomodation_pipeline.py` script provides a Click-based CLI.
+
+### `run` command
+
+```bash
+Usage: cli run [OPTIONS] AUDIO_PATH TRANSCRIPT_PATH
+```
+
+Options:
+
+* `-t, --accommodation-type [turn_level|tama|hybrid]` (default: turn\_level)
+* `-f, --features TEXT` (comma-separated; default: all)
+* `-r, --results-path PATH` (default: `results/`)
+* `--no-viz/--viz` (toggle visualizations; default: viz enabled)
+* `-v, --verbose` (verbose logs)
+* `--synchrony-mode [turn|dynamic|combined]` (default: turn)
+* `--win-frames INTEGER` (window length; default: 10 frames)
+* `--hop-frames INTEGER` (hop length; default: 5 frames)
+* `--state-thresh FLOAT` (classification threshold; default: 0.5)
+* `--loess-frac FLOAT` (LOESS smoothing fraction; default: 0.3)
+
+Workflow:
+
+1. Build `AccomConfig` (calculates frame\_duration).
+2. Extract feature time-series via `.get_accommodation()`.
+3. Compute synchrony, convergence, state metrics.
+4. Save CSV summary, pickles, and PNG plots.
+
+### `list-features` command
+
+```bash
+$ cli list-features
+```
+
+Prints all available feature keys:
+
+````
+mean_f0
+sd_f0
+mean_intensity
+syllables_per_second
+...
+``` 
+
+---
 ## Installation
+```bash
+git clone https://github.com/your-username/vibechecker.git
+cd vibechecker
+python3 -m venv .venv
+source .venv/bin/activate   # macOS/Linux
+.venv\Scripts\activate      # Windows
+pip install -r requirements.txt
+````
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/your-username/prosodic-accommodation.git
-   cd prosodic-accommodation
-   ```
-2. Set up the virtual environment:
-    ```bash
-    python3 -m venv .venv
-    source .venv/bin/activate  # macOS/Linux
-    .venv\Scripts\activate     # Windows
-    ```
-3. Install the Dependencies
-    ```commandline
-    pip install -r requirements.txt
-    ```
-   
+---
+
 ## File Structure
+
 ```
-prosodic-accommodation/
-    ├── accomodation_types/
-        ├── base_acomodation.py
-        ├── hybrid_prosodic_acomodation.py
-        ├── tama_prosodic_accomodation.py
-        ├── turn_level_prosodic_acommodation.py
-    ├── audio_features/
-        ├── audio_features.py
-        ├── my_voice_analysis/
-        ├── my_voice_analysis_features.py
-    ├── data/
-    ├── data_types/
-        ├── audio_file.py
-        ├── transcript_file.py
-    ├── tests/
-        ├── test_turn_taking.py
-        ├── test_tama.py
-        ├── test_hybrid.py
-    ├── prosodic_accomodation_pipeline.py
+vibechecker/
+├── accomodation_types/       # Turn-level, TAMA, Hybrid
+├── audio_features/           # Feature extraction
+├── accom_features/           # Config & FeatureStrategy
+├── data/                     # Example audio & transcripts
+├── data_types/               # Audio & transcript wrappers
+├── prosodic_accomodation_pipeline.py  # CLI entrypoint
+└── tests/                    # Unit tests
 ```
+
+---
+
 ## Usage
 
-### Add the following to data/:
+### Data Preparation
 
-- Audio files (e.g., .wav) for each speaker.
-- Transcripts with time-aligned speech segments or turns.
+1. Place speaker audio (`.wav`) under `data/audio/`.
+2. Add transcript CSV under `data/transcripts/` with columns: `start,end,speaker,text`.
 
-### Run the pipeline
-To run the full analysis, use:
+### Running the Pipeline
 
-   ```commandline
-   python prosodic_accomodation_pipeline.py prosodic_accomodation_pipeline --audio_path data/audio/audio-2.wav --diarization_path          data/combine_speech_turns_df.csv --results_path "results.csv" --accomodation_type turn_level --language_code fr
-   ```
-You can also explore other scripts for more specific analyses:
+```bash
+python prosodic_accomodation_pipeline.py \
+  data/audio/s1_s2.wav data/transcripts/s1_s2.csv \
+  --accommodation-type hybrid \
+  --features mean_f0,syllables_per_second \
+  --results-path results/ \
+  --synchrony-mode combined \
+  --win-frames 20 --hop-frames 10 \
+  --state-thresh 0.6 --loess-frac 0.2 \
+  --no-viz
+```
 
-- turn_level_prosodic_acommodation.py — turn-by-turn prosodic alignment
-- tama_prosodic_accomodation.py — summary-based matching
-hybrid_prosodic_acomodation.py — combines both
+### Listing Features
 
-   ```
-  python prosodic_accomodation_pipeline.py \
-  --audio_path     data/<yourfile>.wav \
-  --transcript_csv data/<yourfile>.csv \
-  --results_path   results/<yourfile> \
-  --accommodation_type <turn_level|hybrid|tama> \
-  --features       <comma‐list‐of‐features> \
-  --visualize      True \
-  --verbose        False
-  ```
+```bash
+python prosodic_accomodation_pipeline.py list-features
+```
+
+---
+
+## Programmatic API
+
+```python
+from accom_features.accom_config import AccomConfig
+from accomodation_types.hybrid_prosodic_acomodation import HybridProsodicAccomodation
+from accom_features.feature_strategy import ConvergenceStrategy, DynamicSynchrony
+
+# 1. Extract time-series
+ac = HybridProsodicAccomodation(
+    audio_path="data/audio/s1.wav",
+    transcript_csv="data/transcripts/s1.csv",
+    requested_features=["mean_f0","sd_f0"],
+    verbose=False
+)
+time_series = ac.get_accommodation()
+
+# 2. Configure metrics
+cfg = AccomConfig(
+    frame_duration=ac.frame_duration,
+    window=15,
+    hop=5,
+    thresh=0.5,
+    synchrony_mode="dynamic"
+)
+
+# 3. Compute metrics
+conv = ConvergenceStrategy(
+    time_series['mean_f0'][:,0],
+    time_series['mean_f0'][:,1],
+    cfg
+).compute()
+sync = DynamicSynchrony(
+    time_series['mean_f0'][:,0],
+    time_series['mean_f0'][:,1],
+    cfg
+).compute()
+```
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.

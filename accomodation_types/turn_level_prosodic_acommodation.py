@@ -128,8 +128,6 @@ class TurnLevelProsodicAccomodation(BaseAccommodation):
                 a_win = pair_arr[i:i + window, 0]
                 b_win = pair_arr[i:i + window, 1]
                 r = self._pearsonr(a_win, b_win)
-                if idx < 3:  # only print first 3 windows
-                    print(f"[DEBUG][{feat}] window {idx}: r = {r:.4f}")
                 rs.append(r)
             results[feat] = np.array(rs)
         return results
@@ -137,17 +135,13 @@ class TurnLevelProsodicAccomodation(BaseAccommodation):
     def get_synchrony(self) -> dict:
         mode = getattr(self, "synchrony_mode", "turn")
         if mode == "turn":
-            print(f"[DEBUG][turn] using _turn_synchrony()")
             return self._turn_synchrony()
         elif mode == "dynamic":
-            print(f"[DEBUG][dynamic] window={self.win_frames}, hop={self.hop_frames}")
             raw = self._dynamic_synchrony(self.win_frames, self.hop_frames)
             return {feat: {"r_values": raw[feat]}
                     for feat in self.requested_features}
         elif mode == "combined":
-            print(f"[DEBUG][combined] combining static+dynamic")
             static = self._turn_synchrony()
-            print(f"[DEBUG][static] mean_f0 r = {static['mean_f0']:.4f}")
             dyn = self._dynamic_synchrony(self.win_frames, self.hop_frames)
             combined = {
                 f: (static[f] + float(np.mean(dyn[f]))) / 2
