@@ -41,16 +41,33 @@ VibeChecker orchestrates the following steps to analyze prosodic accommodation b
 
 ---
 
-## Accomodation Types & Strategies
+## Accomodation Methods Comparison
 
-| Module                                                   | Strategy            | Description                                                                                                                             |       |       |
-| -------------------------------------------------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ----- | ----- |
-| `accomodation_types/turn_level_prosodic_acommodation.py` | Turn‑level          | Pair successive turns: synchrony = PearsonCorr(Aᵢ₋₁, Bᵢ); convergence = PearsonCorr(                                                    | Aᵢ−Bᵢ | , i). |
-| `accomodation_types/tama_prosodic_accomodation.py`       | Fixed-window (TAMA) | Sliding-window on fixed-length frames: average features per-speaker window, then Corr.                                                  |       |       |
-| `accomodation_types/hybrid_prosodic_acomodation.py`      | Hybrid              | Utterance-sensitive TAMA: extend fixed windows to nearest utterance boundaries per speaker.                                             |       |       |
-| `accom_features/feature_strategy.py`                     | Strategies & States | Implements `TurnSynchrony`, `DynamicSynchrony`, `CombinedSynchrony`, `ConvergenceStrategy`, `StateStrategy`, `ConcurrentStrategy`, etc. |       |       |
+| Method                    | How computed                                                             | What it returns                                 | What it captures                          | Pros                                              | Cons                                                        | When to use                                        | Most similar to                    |
+| ------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------- | ----------------------------------------- | ------------------------------------------------- | ----------------------------------------------------------- | -------------------------------------------------- | ---------------------------------- |
+| **Turn-level “turn”**     | Correlate A’s feature at turn i−1 with B’s at turn i across all turns    | One Pearson r per feature                       | Overall lag-1 turn-taking synchrony       | Very simple; no extra parameters                  | No time course; ignores within-turn variation               | Quick high-level check of turn-by-turn synchrony   | **Combined**                       |
+| **Turn-level “dynamic”**  | Slide window of consecutive turns, compute Pearson r each window         | Time-series of r values with timestamps         | Local synchrony fluctuations              | Time-resolved; shows ups and downs                | Sensitive to window/hop choices; can be noisy               | Examining how synchrony evolves during interaction | **TAMA (dynamic)**                 |
+| **Turn-level “combined”** | Average of turn-level r and mean dynamic-window r                        | One averaged Pearson r per feature              | Blend of static and dynamic synchrony     | Balances coarse and fine information              | Arbitrary equal weighting; still no time course             | Single metric reflecting both views                | Bridges **turn** & **dynamic**     |
+| **TAMA**                  | Extract features in overlapping windows; compute Pearson r in each frame | Detailed time-series of r values and timestamps | Continuous synchrony at regular intervals | Robust to segmentation errors; uniform resolution | Ignores utterance boundaries; window choice critical        | Uniform analysis independent of turn boundaries    | **Turn-level dynamic**             |
+| **HYBRID**                | Extend windows to utterance boundaries then sliding-window correlation   | Time-series of r values and timestamps          | Dynamics that respect utterance structure | Captures utterance-level prosody; multiscale      | Requires good utterance segmentation; more complex pipeline | When utterance-level prosody matters               | Mix of **turn-dynamic** & **TAMA** |
 
-Configure specifics—window size, hop length, thresholds—via the `AccomConfig` class.
+### Similarities & Differences
+
+All methods use Pearson *r* as their core metric. Dynamic, TAMA, and HYBRID return time-series of *r* values plus timestamps (and optional phase counts); turn and combined return a single scalar per feature.
+
+* **Window Basis**: TAMA uses uniform time frames; dynamic slides over turn indices; HYBRID aligns to utterance boundaries.
+* **Granularity**: Turn and combined yield scalars; dynamic, TAMA, HYBRID yield time-series.
+* **Segmentation Sensitivity**: TAMA is robust to transcript errors; HYBRID requires accurate utterance segmentation; turn methods ignore within-turn variations.
+
+### When to Pick Which
+
+* **Turn-level “turn”**: Quick, interpretable overall check of turn-by-turn synchrony.
+* **Turn-level “dynamic”**: Examine local fluctuations of synchrony across the conversation.
+* **Turn-level “combined”**: One summary metric blending static and dynamic views.
+* **TAMA**: Uniform, transcript-independent analysis; ideal when turn boundaries are unreliable.
+* **HYBRID**: Utterance-grounded dynamic analysis; use when prosody at the utterance scale matters.
+
+Configure specifics—window size, hop length, thresholds—via the `AccomConfig` class.—window size, hop length, thresholds—via the `AccomConfig` class.
 
 ---
 
@@ -119,8 +136,7 @@ Extracted by `AudioFeatures` in `audio_features/audio_features.py`:
 * **Pitch (F0)**: min, max, mean, median, SD, range, 80th-percentile.
 * **Intensity**: mean & SD of amplitude contour.
 * **Articulation Rate**: syllable nuclei per second (De Jong & Wempe, 2009).
-* **Sampling**: Optional resampling (default 16 kHz).
-* **Caching**: Segment-level FFTs and stats are cached for efficiency.
+* **csi**: 
 
 Use `extract_all()` to retrieve all features or `extract(keys=[...])` for a subset.
 
