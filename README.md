@@ -2,6 +2,8 @@
 
 VibeChecker is a Python library for measuring prosodic accommodation between two speakers in a conversation. It extracts low‑level audio features, applies configurable accommodation strategies, and produces both turn‑level and sliding‑window summary metrics.
 
+<img width="2000" height="1500" alt="audio" src="https://github.com/user-attachments/assets/f04f3dfb-3191-4c9d-8ef5-ac112c72b16c" />
+
 ---
 
 ## Table of Contents
